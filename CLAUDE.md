@@ -84,6 +84,7 @@ workspace sync
 | Build commands, testing, and dev servers | [docs/build-and-test.md](docs/build-and-test.md) | When building or running tests |
 | Code patterns, conventions, and git workflow | [docs/patterns.md](docs/patterns.md) | Before writing or reviewing code |
 | Infrastructure systems and deployment | [docs/infrastructure.md](docs/infrastructure.md) | When touching infra-related code |
+| Security architecture and service account auth | [docs/security-architecture.md](docs/security-architecture.md) | When working with auth, DV tokens, or service accounts |
 | Domain terminology and jargon | [docs/glossary.md](docs/glossary.md) | When encountering unfamiliar terms |
 | Design decisions and rationale | [docs/design-decisions/](docs/design-decisions/) | When questioning why something works this way |
 | Product domain and features | [docs/product/](docs/product/) | When adding features or changing behavior |
