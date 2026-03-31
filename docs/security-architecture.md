@@ -325,14 +325,38 @@ A common pitfall: the service account authenticates **before** any DAG has been 
 
 ## REFRESHED_SERVICE_ACCOUNTS Mechanism (utils.py:40-47)
 
-An escape hatch exists: the `REFRESHED_SERVICE_ACCOUNTS` environment variable (comma-separated list of usernames). Service accounts in this list:
-- Will have their roles refreshed from LDAP on every authentication
-- Will hit LDAP servers (adds latency)
-- Useful for service accounts that need dynamic role recalculation
+An escape hatch exists in the code: the `REFRESHED_SERVICE_ACCOUNTS` environment variable (comma-separated list of usernames). Service accounts in this list would have their roles refreshed from LDAP on every authentication.
 
-```bash
-# Set in oklahoma-airflow-deployment helm values or env config
-REFRESHED_SERVICE_ACCOUNTS=svc-git-dali,svc-another-account
+**However, this env var is NOT set on any cluster.** It exists in the provider code but was never configured in `oklahoma-airflow-deployment` Helm charts or Dockerfiles. So it is not a viable workaround today.
+
+## Manual DB Fix for Blocked Service Accounts
+
+When a `svc-*` service account hits the 401 bug described above, the immediate fix is to manually insert the user into the Airflow metastore with `LI_BASE_USER` role.
+
+**Example: Unblocking `svc-git-dali` on holdem (2026-03-31)**
+
+```sql
+-- Get the LI_BASE_USER role id
+SELECT @role_id := id FROM ab_role WHERE name = 'LI_BASE_USER';
+
+-- Create the user
+INSERT INTO ab_user (first_name, last_name, username, email, active, login_count)
+VALUES ('Service (svc-git-dali)', 'Account', 'svc-git-dali', 'dali-alerts@linkedin.com', 1, 0);
+
+-- Link user to LI_BASE_USER role
+INSERT INTO ab_user_role (user_id, role_id)
+VALUES (LAST_INSERT_ID(), @role_id);
+
+-- Verify
+SELECT u.username, r.name AS role_name
+FROM ab_user u
+JOIN ab_user_role ur ON u.id = ur.user_id
+JOIN ab_role r ON ur.role_id = r.id
+WHERE u.username = 'svc-git-dali';
 ```
 
-This forces the svc-* path to call LDAP and use `_ldap_calculate_user_roles()`, which properly includes `LI_BASE_USER` and any LDAP-group-based roles.
+**Important notes:**
+- Must be run on each cluster's DB separately (holdem, corp, war, etc.)
+- After this, `GET /api/v1/dags` returns 200 but with empty results until DAGs grant `access_control`
+- The user's DL email should be used for the email field (from go/lidm), not the fake email pattern
+- On next authentication, the code's `refresh_role_override` logic may trigger (user has exactly 1 role = LI_BASE_USER), which forces a role recalculation. If a matching `svc-git-dali` role exists from a DAG's `access_control`, it will be added automatically.
