@@ -1,43 +1,3 @@
-<!-- WORKSPACE CLI MANAGED - DO NOT EDIT THIS SECTION -->
-## Workspace Overview
-
-This directory contains several interconnected repositories managed by the `workspace` CLI.
-Changes to one of these repositories will likely need to be reflected in others.
-Because of that, you need to explore all of them before proposing a change plan.
-
-### Managing Repositories
-
-To add a new repository to this workspace:
-
-```bash
-workspace add <MP-name>
-```
-
-Where `<MP-name>` is the name of the multiproduct to add.
-
-To get a list of products in a workspace:
-
-```bash
-workspace list
-```
-
-### Committing Changes
-
-Before committing any changes, always run:
-
-```bash
-workspace clean
-```
-
-This will remove the scaffolding connecting the repositories that can
-cause a CI failure if pushed to the remote repository.
-
-After committing, run this to reconnect the workspace:
-
-```bash
-workspace sync
-```
-<!-- END WORKSPACE CLI MANAGED -->
 
 # Oklahoma Managed Airflow
 
@@ -108,3 +68,44 @@ workspace sync
 1. Commit workspace scaffolding files — always `workspace clean` first
 2. Hardcode secrets — use KMS via `kms_utils.py`
 3. Bypass DAG policy enforcement — picli checks are mandatory before CRT deployment
+
+<!-- WORKSPACE CLI MANAGED - DO NOT EDIT THIS SECTION -->
+## Workspace Overview
+
+This directory contains several interconnected repositories managed by the `workspace` CLI.
+Changes to one of these repositories will likely need to be reflected in others.
+Because of that, you need to explore all of them before proposing a change plan.
+
+### Managing Repositories
+
+To add a new repository to this workspace:
+
+```bash
+workspace add <MP-name>
+```
+
+Where `<MP-name>` is the name of the multiproduct to add.
+
+To get a list of products in a workspace:
+
+```bash
+workspace list
+```
+
+### Committing Changes
+
+Before committing any changes, always run:
+
+```bash
+workspace clean
+```
+
+This will remove the scaffolding connecting the repositories that can
+cause a CI failure if pushed to the remote repository.
+
+After committing, run this to reconnect the workspace:
+
+```bash
+workspace sync
+```
+<!-- END WORKSPACE CLI MANAGED -->
