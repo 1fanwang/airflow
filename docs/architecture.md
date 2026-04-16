@@ -106,6 +106,33 @@ tradewind (federated UI) ◄── trails-tools (analytics + AI failure analysis
 - **rdev-cli → rdev-server → rdev-api**: CLI communicates with server via gRPC definitions from rdev-api
 - **airflow-autopilot → lipy-airflow-providers**: Scores DAGs using provider policy framework
 
+## Policy Enforcement Layer
+
+DAG policy enforcement runs in two systems within `lipy-airflow-providers/airflow-policy-framework`:
+
+### Old: @DagPolicy Framework
+
+The original framework in `policies/lnkd/dag/validation.py` and `alerting.py` uses the `@DagPolicy` decorator. It currently has 6 registered checks:
+
+1. `dag_id_naming_convention` -- naming conventions with exemption lists
+2. `dagrun_timeout_validation` -- task timeout < dag timeout
+3. `deprecated_operator_validation` -- blocks banned operators
+4. `disallowed_dag_access_role_validation` -- blocks unsafe access roles
+5. `airflow_prod_on_failure_alert` -- composite IRIS/FlowSentinel callback check
+6. `airflow_prod_sla_miss_alert` -- composite dagrun_timeout/FlowSentinel SLA check
+
+These checks raise `PolicyViolation` on failure (hard enforcement). `picli` loads and runs them at build time via DagBag.
+
+### New: native/ Module
+
+The `native/` module implements Airflow's built-in cluster policy hooks (`dag_policy`, `task_policy`). It currently has 6 soft checks that use `logger.warning()` for advisory enforcement rather than raising exceptions. This enables the same policy logic to run both locally via picli and server-side on the Airflow scheduler.
+
+Reference PRs:
+- lipy-airflow-providers #1182 (native Phase 1), #1185 (soft checks)
+- picli #680 (adapter), #681 (wire soft checks)
+
+The long-term plan is to converge both systems so that all checks run as native cluster policies (see DD-005 in [design-decisions/](design-decisions/README.md)).
+
 ## Dependency Graph (from product-spec.json)
 
 Key internal dependencies:

@@ -40,6 +40,14 @@ This directory captures significant architectural and design decisions for the O
 
 **Consequences**: Airflow operators in `lipy-airflow-providers` submit jobs through Grid Gateway. Job lifecycle management is centralized.
 
+### DD-005: Native Policy Convergence
+
+**Context**: picli's custom `@DagPolicy` framework and Airflow's built-in cluster policies (`dag_policy`/`task_policy`) are two separate enforcement paths. Maintaining both increases complexity and divergence between local checks and server-side enforcement.
+
+**Decision**: Converge on Airflow's native cluster policy hooks. New checks are added as native functions in `lipy-airflow-providers/airflow-policy-framework/native/` that log warnings (soft enforcement) rather than raising exceptions. picli loads these via an adapter so the same code runs at build time and on the Airflow scheduler. Plan doc at picli PR #679.
+
+**Consequences**: Policies run identically in local (picli) and server-side (scheduler) contexts. New soft checks provide advisory feedback without blocking deployment. The old `@DagPolicy` checks will be migrated to native functions over time. Reference PRs: lipy-airflow-providers #1182, #1185; picli #680, #681.
+
 ## Adding New Decisions
 
 Create a new entry above with format:
