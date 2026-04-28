@@ -6,6 +6,8 @@
 
 Infrastructure systems used across this workspace. Detailed skill files with usage patterns and code-level conventions are in `.claude/skills/infrastructure/`. This document provides the cross-repo view.
 
+For detailed per-system reference pages covering GGW, Spark, Kafka, and 12 other LinkedIn systems, see [Systems Reference](systems/README.md).
+
 ## Detected Systems
 
 See `.claude/skills/infrastructure/SKILL.md` for the complete detection summary. Key systems:

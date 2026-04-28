@@ -40,12 +40,25 @@
 
 | Topic | Location | Read When |
 |-------|----------|-----------|
+| Platform overview (start here) | [docs/overview.md](docs/overview.md) | First time orienting to Oklahoma Airflow |
 | System architecture and repo relationships | [docs/architecture.md](docs/architecture.md) | Before cross-repo changes |
+| Cluster details (Holdem, War, Faro, Corp, rdev) | [docs/clusters.md](docs/clusters.md) | When debugging cluster-specific issues |
+| DAG authoring — operators, sensors, conventions | [docs/dag-authoring.md](docs/dag-authoring.md) | When writing or reviewing DAGs |
+| Deployment procedures (CRT/LCD, rollback) | [docs/deployment.md](docs/deployment.md) | When deploying or troubleshooting deploys |
+| Troubleshooting — failure taxonomy, debug checklist | [docs/troubleshooting.md](docs/troubleshooting.md) | When debugging task/DAG failures |
+| Metrics and observability (OTEL, Grafana) | [docs/metrics.md](docs/metrics.md) | When working with metrics or dashboards |
+| Cluster provisioning runbook | [docs/cluster-creation.md](docs/cluster-creation.md) | When creating a new Airflow cluster |
 | Build commands, testing, and dev servers | [docs/build-and-test.md](docs/build-and-test.md) | When building or running tests |
 | Code patterns, conventions, and git workflow | [docs/patterns.md](docs/patterns.md) | Before writing or reviewing code |
 | Infrastructure systems and deployment | [docs/infrastructure.md](docs/infrastructure.md) | When touching infra-related code |
 | Security architecture and service account auth | [docs/security-architecture.md](docs/security-architecture.md) | When working with auth, DV tokens, or service accounts |
 | Domain terminology and jargon | [docs/glossary.md](docs/glossary.md) | When encountering unfamiliar terms |
+| Oncall runbooks and alert response | [docs/oncall/](docs/oncall/) | When on-call or responding to alerts |
+| Jira issue patterns and playbooks | [docs/jira/](docs/jira/) | When triaging tickets or recognizing issue types |
+| System dependencies (GGW, Spark, Kafka, etc.) | [docs/systems/](docs/systems/) | When debugging system integrations |
+| Codebase deep dives, gotchas, fork internals | [docs/codebase/](docs/codebase/) | When hitting non-obvious behaviors or bugs |
+| Team roster and active workstreams | [docs/teams/](docs/teams/) | When checking who owns what |
+| Open questions and synthesis | [docs/synthesis/](docs/synthesis/) | When investigating unresolved issues |
 | Design decisions and rationale | [docs/design-decisions/](docs/design-decisions/) | When questioning why something works this way |
 | Product domain and features | [docs/product/](docs/product/) | When adding features or changing behavior |
 | Quality grades and tech debt | [docs/quality/](docs/quality/) | During reviews or refactoring |

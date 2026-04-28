@@ -1,10 +1,6 @@
-# Build and Test
-
 > Part of the workspace knowledge base. See [CLAUDE.md](../CLAUDE.md) for the navigation map.
 
-## Overview
-
-Quick-reference build, test, lint, and dev server commands for all repositories in the workspace. For repo-specific testing internals (fixtures, mocking, test data), see the repo's own documentation.
+# Build and Test
 
 ## Workspace Commands
 
@@ -14,75 +10,90 @@ Quick-reference build, test, lint, and dev server commands for all repositories 
 | `workspace pull` | Pull latest changes from all repos |
 | `workspace list` | List multiproducts and their status |
 | `workspace add <name>` | Add a multiproduct to the workspace |
-| `workspace clean` | Remove workspace scaffolding before committing |
-| `workspace sync` | Reconnect workspace after committing |
+| `workspace clean` | **Always run before committing** — removes scaffolding that causes CI failures |
+| `workspace sync` | **Run after committing** — reconnects the workspace |
 
-**Important**: Always run `workspace clean` before committing and `workspace sync` after.
+---
 
-## Build Command Reference
+## Branch Notes
 
-### Gradle-based repos (Java/Scala/Python with Gradle)
+- **airflow**: branch `BR_REL_li-2.9.2` — never commit to master
+- **lipy-airflow-providers**: branch `BR_REL_airflow-2.9.2` — never commit to master
+- All other repos: `master`
 
-| Repository | Build | Test | Lint/Format |
-|------------|-------|------|-------------|
+---
+
+## Gradle-Based Repos (Java / Scala / Python with Gradle)
+
+| Repository | Build | Test | Lint / Format |
+|------------|-------|------|---------------|
 | lipy-airflow-providers | `./gradlew build` | `./gradlew pytest coverageByOwner` | `./gradlew ruff` |
-| oklahoma-airflow-deployment | `./gradlew buildImage` | `mint buildImage` | N/A |
-| airflow-crt-action | `./gradlew -Prelease=true build` | `./gradlew pytest` | N/A |
+| oklahoma-airflow-deployment | `./gradlew buildImage` | `mint buildImage` | — |
+| airflow-crt-action | `./gradlew -Prelease=true build` | `./gradlew pytest` | — |
 | airflow-workflow-gradle-plugin | `./gradlew build -Prelease=true` | `./gradlew build coverageByOwner` | checkstyle, spotbugs |
-| airflow_starter_kit | `./gradlew -Prelease=true build` | `./gradlew check coverageByOwner` | N/A |
+| airflow_starter_kit | `./gradlew -Prelease=true build` | `./gradlew check coverageByOwner` | — |
 | airflow-load-testing | `./gradlew -Prelease=true build` | `./gradlew pytest` | `./gradlew ruff` |
-| oklahoma_system_dags | `./gradlew build` | N/A (integration via clusters) | N/A |
-| airflow-workflow | `./gradlew build` | `mint test-template` | N/A |
+| oklahoma_system_dags | `./gradlew build` | — (integration via clusters) | — |
+| airflow-workflow | `./gradlew build` | `mint test-template` | — |
 | mufn-service | `./gradlew build` | `./gradlew test` (ScalaTest) | scoverage (40% min) |
-| bdp-artifact-metadata-service | `./gradlew build` | `./gradlew test` | N/A |
+| bdp-artifact-metadata-service | `./gradlew build` | `./gradlew test` | — |
 | picli | `./gradlew build` | `./gradlew pytest coverageByOwner` | black, isort, mypy |
-| rdev-api | `./gradlew build` | N/A (API definitions) | N/A |
+| rdev-api | `./gradlew build` | — (API definitions only) | — |
 | rdev-cli | `./gradlew build` | `./gradlew pytest coverageByOwner` | black, isort, mypy |
 | rdev-server | `./gradlew build` | `./gradlew pytest coverageByOwner` | black, isort, mypy |
-| rdev-base-image | `./gradlew build` | N/A (Docker images) | N/A |
+| rdev-base-image | `./gradlew build` | — (Docker images) | — |
 | roundup-workflows | `./gradlew build` | `./gradlew pytest coverageByOwner` | black, isort, mypy |
 | orchestrator-tde | `./gradlew build` | `.linkedin/bin/tox -e test,coverage-by-owner` | ruff, mypy |
-| airflow-oc-image | `./gradlew build` | `./gradlew pytest` | N/A |
-| gdp-sales-analytics | `./gradlew build` | `./gradlew pytest` | N/A |
+| airflow-oc-image | `./gradlew build` | `./gradlew pytest` | — |
+| gdp-sales-analytics | `./gradlew build` | `./gradlew pytest` | — |
 
-### Python-native repos (tox/uv/hatch)
+---
 
-| Repository | Build | Test | Lint/Format |
-|------------|-------|------|-------------|
-| airflow | `python setup.py build` | `pytest tests/` | N/A |
+## Python-Native Repos (tox / uv / hatch)
+
+| Repository | Build | Test | Lint / Format |
+|------------|-------|------|---------------|
+| airflow (fork) | `python setup.py build` | `pytest tests/` | — |
 | airflow-autopilot | `mint setup && .linkedin/bin/tox -p` | `.linkedin/bin/tox -e test,coverage-by-owner` | ruff format + check |
 | li-productivity-agents | `uv sync` (per module) | `pytest` (per module) | ruff, pyright |
 | training-platform-agents | `uv sync` (per module) | `pytest` (per module) | ruff |
-| torch-autopilot | `uv sync` | `pytest test/` | N/A |
+| torch-autopilot | `uv sync` | `pytest test/` | — |
 
-### Frontend repos (Node.js/Yarn)
+---
 
-| Repository | Build | Test | Lint/Format |
-|------------|-------|------|-------------|
-| airflow-docs | `yarn build` | `yarn test` | N/A |
-| tradewind (frontend) | `cd frontend && npm run build` | `npm run test` (Vitest) | N/A |
-| trails-tools (frontend) | `cd ux && npm run build` | N/A | N/A |
+## Frontend Repos (Node.js / Yarn / npm)
 
-### Python webapp repos (tox + Flask/FastAPI)
+| Repository | Build | Test | Notes |
+|------------|-------|------|-------|
+| airflow-docs | `yarn build` | `yarn test` | Docusaurus site |
+| tradewind (frontend) | `cd frontend && npm run build` | `npm run test` | Vitest |
+| trails-tools (frontend) | `cd ux && npm run build` | — | — |
 
-| Repository | Build | Test | Lint/Format |
-|------------|-------|------|-------------|
+---
+
+## Python Webapp Repos (tox + Flask / FastAPI)
+
+| Repository | Build | Test | Lint / Format |
+|------------|-------|------|---------------|
 | tradewind | `mint setup` | `.linkedin/bin/tox -e test` | ruff, mypy |
 | trails-tools | `mint setup` | `.linkedin/bin/tox -e test` | ruff, mypy |
 
-## Repo-Specific Testing Details
+---
 
-For detailed test fixtures, mocking strategies, and test data setup patterns, see each repo's own docs:
+## Repo-Specific Testing Docs
 
-| Repository | Testing Docs Location |
-|------------|----------------------|
+For detailed fixtures, mocking strategies, and test data patterns:
+
+| Repository | Docs Location |
+|------------|--------------|
 | lipy-airflow-providers | `.linkedin/ai-agent/` |
 | airflow-autopilot | `.linkedin/ai-agent/` and `.claude/CLAUDE.md` |
 | picli | `.linkedin/ai-agent/` |
 | orchestrator-tde | `.linkedin/ai-agent/` |
 
-## Branch Notes
+---
 
-- **airflow**: Uses branch `BR_REL_li-2.9.2` (not master)
-- **lipy-airflow-providers**: Uses branch `BR_REL_airflow-2.9.2` (not master)
-- All other repos use `master` as their primary branch
+## See Also
+- [Codebase Overview](codebase/README.md) — Key repos, entry points, working branches
+- [Deployment](deployment.md) — CRT/LCD flow, picli commands, RDev testing
+- [Gotchas](codebase/gotchas.md) — Known footguns that affect builds
