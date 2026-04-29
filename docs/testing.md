@@ -31,3 +31,14 @@ uv tool run tox config -e test312
 - Runner: virtualenv
 - `skip_install = true` — tox does not install the package
 - External tools allowed: bash, uv, pytest, ./scripts/ci/install_breeze.sh
+
+## Running Tests with Tox
+
+Tox is available via `uv tool run tox` (version 4.53.0 available at runtime).
+
+**Note**: Test environments (`test310`, `test311`, `test312`, `ci`) are configured in `tox.ini` but currently have empty `commands` sections. Running `uv tool run tox run -e test310` succeeds but performs no actual test execution. The environments inherit base settings:
+- `base_python = python3.12`
+- `skip_install = True`
+- Standard environment variables set (PIP_DISABLE_PIP_VERSION_CHECK, PYTHONHASHSEED, etc.)
+
+Test commands need to be added to the environment definitions in `tox.ini` before tox will actually run tests.
