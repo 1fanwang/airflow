@@ -61,3 +61,14 @@ The tox configuration defines test environments (test310, test311, test312, prep
 - `deps =` (empty)
 
 This means test environments need command definitions in tox.ini before they can actually run tests. Check tox.ini for commented-out or incomplete command definitions.
+
+## Tox Test Infrastructure
+
+**Status**: tox is configured but non-functional.
+
+- **Availability**: Not directly installed. Run via `uv tool run tox` (v4.53.0 available)
+- **Environments defined**: `prepare`, `test310`, `test311`, `test312`, `ci`
+- **Issue**: test310/311/312 environments have **no commands defined** — they are empty shells that pass trivially without executing any tests
+- **Impact**: `uv tool run tox run -e test310` succeeds (0.32s) but doesn't run any actual tests
+
+These environments need command definitions in `tox.ini` to function as test runners.
