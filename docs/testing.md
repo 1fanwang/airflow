@@ -72,3 +72,18 @@ This means test environments need command definitions in tox.ini before they can
 - **Impact**: `uv tool run tox run -e test310` succeeds (0.32s) but doesn't run any actual tests
 
 These environments need command definitions in `tox.ini` to function as test runners.
+
+## tox Test Runner
+
+The repository includes a `tox.ini` configuration file with test environments (prepare, test310, test311, test312, ci), but the test environments (test310, test311, test312) are currently empty shells with no commands or dependencies defined.
+
+**To run tox:**
+```bash
+uv tool run tox --version
+uv tool run tox list          # List available environments
+uv tool run tox run -e test310  # Run a specific environment (will succeed but do nothing)
+```
+
+tox is not installed as a system dependency but can be executed via `uv tool run` (uv manages the tox installation). However, the actual test environments lack command definitions, so running them will complete successfully without executing any tests.
+
+For now, use the testing infrastructure outside of tox directly.
