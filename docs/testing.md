@@ -87,3 +87,16 @@ uv tool run tox run -e test310  # Run a specific environment (will succeed but d
 tox is not installed as a system dependency but can be executed via `uv tool run` (uv manages the tox installation). However, the actual test environments lack command definitions, so running them will complete successfully without executing any tests.
 
 For now, use the testing infrastructure outside of tox directly.
+
+## Tox Test Environments - Incomplete Configuration
+
+**Status**: The tox test environments (`test310`, `test311`, `test312`) are defined in `tox.ini` but are not fully configured.
+
+**Finding**: When attempting to run tox test environments, they complete immediately without executing any tests because:
+- No `commands` are defined in the test environment configuration
+- No dependencies (`deps`) are specified
+- `skip_install = True` is set
+
+**Availability**: Tox 4.53.0 is available via `uv tool run tox`, but the test environments will not run actual tests without proper configuration.
+
+**Workaround**: Tests should be run using the project's primary test runner (likely pytest or similar) directly, not through tox environments, until the tox test configuration is completed.
