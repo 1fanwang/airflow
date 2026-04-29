@@ -42,3 +42,22 @@ Tox is available via `uv tool run tox` (version 4.53.0 available at runtime).
 - Standard environment variables set (PIP_DISABLE_PIP_VERSION_CHECK, PYTHONHASHSEED, etc.)
 
 Test commands need to be added to the environment definitions in `tox.ini` before tox will actually run tests.
+
+## Running Tests with tox
+
+tox is available in this codebase but must be invoked via uv:
+
+```bash
+uv tool run tox list          # List available environments
+uv tool run tox run -e test310 # Run test310 environment
+```
+
+### Current Test Environment Status
+
+The tox configuration defines test environments (test310, test311, test312, prepare, ci) but they currently have **no commands configured**. Running `uv tool run tox run -e test310` will succeed without executing any actual tests:
+
+- `skip_install = True`
+- `commands =` (empty)
+- `deps =` (empty)
+
+This means test environments need command definitions in tox.ini before they can actually run tests. Check tox.ini for commented-out or incomplete command definitions.
