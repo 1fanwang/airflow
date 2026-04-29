@@ -220,6 +220,15 @@ mint publish ... # Publish to Artifactory
 ### PipelineMD Global Extra Link Plugin (Apr 2026)
 - PipelineMD diagnosis button was only visible for tasks with operator-level extra links. Created a proper Airflow plugin (`pipelinemd_plugin.py`) registered via `global_operator_extra_links` so PMD button appears for every task ([#1171](https://github.com/linkedin/lipy-airflow-providers/pull/1171))
 
+### DarwinOperator Disruption Readiness (Apr 2026)
+- `DarwinOperator.execute()` previously reimplemented the GGW execution flow inline instead of delegating to `GridGatewayBaseOperator._execute()`. This meant `_external_job_id` was never set after `start_execution`, so disruption readiness (external job checkpoint resume) was broken. PR #1193 fixes this. Darwin is now a supported disruption-ready function type.
+
+### RDev EmailOperator Redirect (Apr 2026)
+- `EmailOperatorPatchPlugin` — an Airflow plugin that intercepts all `EmailOperator` sends in rdev and redirects both `to` and `from` to `$USER@linkedin.com`, preventing spam to team distribution lists during testing. PR #1187 (2026-04-18).
+
+### airflow-oc-image Launcher Bump (Apr 2026)
+- Bumped `airflow-oc-image` launcher in `FlyteOperator` from `0.1.105` → `0.1.113` → `0.1.114`. Picks up SSL trust fix for non-Grestin Ambassador clusters and Flyte TLS fix. PRs #1194 (2026-04-21), #1202 (2026-04-23).
+
 ### Bug Fixes & Hardening
 - Fix stale NFS file handle failures ([#1065](https://github.com/linkedin/lipy-airflow-providers/commit/0578347f))
 - DAG timeout handling for Iris context ([#1024](https://github.com/linkedin/lipy-airflow-providers/commit/90565bd9))

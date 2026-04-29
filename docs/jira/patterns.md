@@ -768,6 +768,56 @@ Or: schema validation fails at write time with nullability mismatch between the 
 
 ---
 
+## P32 — Spark 3.1 Iceberg Sort Injection Gap (write.distribution.mode=hash)
+
+**Trigger**: A Spark 3.1 job writes to an OpenHouse/Iceberg table configured with `write.distribution.mode=hash` and `write ordered by` properties. The write fails with `IllegalStateException` because Spark 3.1 does not inject a sort node before `AppendData`, unlike Spark 3.5 which handles this correctly.
+
+**Signature**:
+```
+IllegalStateException: Incoming records violate the writer assumption that records are clustered by spec and by partition
+```
+Task fails at write time with Iceberg partition violation. The Spark job may have appeared to run correctly up to the write phase.
+
+**Root cause**: In Spark 3.1, the Iceberg integration does not automatically inject a `Sort` physical plan node before `AppendData` when `write.distribution.mode=hash` and `write ordered by` are specified on the table. Spark 3.5 correctly adds this sort. This is a version-specific gap in the Spark-Iceberg integration — it is unclear whether this is intentional or a bug in the older Spark version.
+
+**Frequency**: Low — affects DAGs running on Spark 3.1 that write to Iceberg tables with hash distribution mode. Will become less common as teams migrate to Spark 3.5.
+
+**Related systems**: Spark (3.1 specifically), Iceberg, OpenHouse, Grid Gateway
+
+**Fix**:
+1. **Preferred**: Upgrade to Spark 3.5 where the sort injection is automatic.
+2. **Workaround**: Manually add `.sortWithinPartitions(...)` or `.repartition(...)` before the Iceberg write to ensure records are properly ordered.
+3. Remove `write.distribution.mode=hash` from the table properties if hash distribution is not required.
+
+**Source**: APA-145082 (Closed — Fixed, Apr 2026)
+
+---
+
+## P33 — Dali/Jasper Partition Check False Failure on Holdem (Recurring)
+
+**Trigger**: A Spark job using Dali SDK or Jasper to check partition existence for a tracking table (e.g., `tracking.profileeditevent`) on the Holdem cluster falsely reports that partitions do not exist, despite the data being present. Similar to P29 (ARMS PartitionSensor False Negative) but occurs within Spark job code rather than Airflow sensors.
+
+**Signature**:
+```
+DaliException: Partition check failed for tracking.profileeditevent
+```
+Or: Jasper `checkAllPartitionsExist` returns false for partitions confirmed present via direct Trino/Hive query.
+
+**Root cause**: The Dali SDK or Jasper client within the Spark job is using a stale or buggy version that fails to resolve partitions correctly for certain table types (particularly Hive views over OpenHouse tables or tracking tables). This is the same class of bug as P29 — related to `dali-data-sdk` version regressions.
+
+**Frequency**: Low — 1 confirmed instance (APA-144143, Closed — Fixed, Apr 2026).
+
+**Related systems**: Dali SDK, Jasper, Spark, Holdem cluster, OpenHouse
+
+**Fix**:
+1. Verify the `dali-data-sdk` version used by the Spark job matches the latest known-good version.
+2. Check if the partition exists via direct Hive/Trino query as a workaround.
+3. Escalate to Data Triggers / ARMS team if the SDK version is correct and the issue persists.
+
+**Source**: APA-144143 (Closed — Fixed, Apr 2026)
+
+---
+
 ## Quick Reference Table
 
 | # | Pattern | Key Signature | Frequency | Systems |
@@ -803,6 +853,8 @@ Or: schema validation fails at write time with nullability mismatch between the 
 | P29 | ARMS PartitionSensor false negative | `poke result: False, description:` (empty) for partitions confirmed present | Low (2 instances, onset 4/13) | ARMS, PartitionSensor, Holdem/War |
 | P30 | Spark KJP startup timeout (HDFS degradation) | `Power failure` (SIGPWR) in executor logs; zero tasks run; driver: "no resources" before exit | Low (spikes during HDFS events) | KJP, HDFS, Volcano, GGW, Airflow timeouts |
 | P31 | DaliException schema nullability mismatch | `DaliException` / Avro schema nullability check fails on dataframe schema | Low (1 instance Apr 2026) | Dali, Avro, Spark, Hive |
+| P32 | Spark 3.1 Iceberg sort injection gap | `IllegalStateException: Incoming records violate the writer assumption` with `write.distribution.mode=hash` | Low (Spark 3.1 only) | Spark 3.1, Iceberg, OpenHouse |
+| P33 | Dali/Jasper partition check false failure | Dali SDK `checkAllPartitionsExist` returns false for existing partitions on Holdem | Low (1 instance) | Dali SDK, Jasper, Holdem |
 
 ---
 

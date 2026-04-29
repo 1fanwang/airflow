@@ -262,6 +262,17 @@ The LCD saga (PRs #1060→#1064→#1066→#1067→#1070) was self-contained — 
 
 **OPAL workflow cutovers (APA-144983, 144985, 144986)**: Three `prod_workflow` tables (`workflows`, `activities`, `activity_queue`) completed transparent Oracle→MySQL cutover.
 
+### [2026-04-29] No Regressions — Spark 3.1 Iceberg Gap + OPAL Cutovers Continue
+
+**Regression check**: 18 merged PRs (oklahoma-airflow-deployment #1048–#1070, airflow #101–#120, lipy-airflow-providers #1167–#1203, picli #657–#686, tradewind #63–#85) vs 10 open tickets. **No regressions detected.**
+
+Notable signals (not regressions):
+- **APA-145082** (Closed): Spark 3.1 does not inject sort before AppendData for Iceberg tables with `write.distribution.mode=hash`. This is a Spark 3.1-specific gap, not caused by any merged PR. Added as pattern P32 in [Jira Patterns](../jira/patterns.md).
+- **APA-145083** (Open): Same Spark 3.1/Iceberg issue still tracked as open (companion to APA-145082).
+- **APA-145076** (Open): HDFS NameNode capacity alert on `ltx1-holdem-cluster11` — continuation of the ongoing multi-wave NameNode alert series (Waves 1–7 documented above).
+- **APA-144143** (Closed — Fixed): Dali SDK/Jasper falsely failing partition check for `tracking.profileeditevent` on Holdem. Same class as P29 (ARMS false negative). Added as pattern P33 in [Jira Patterns](../jira/patterns.md).
+- **OPAL cutovers (APA-145057, APA-145063)**: PTAGENT schema — `STANDING_INSTRUCTIONS` and `PPRO_TX` transparent cutovers resolved. This is a **sixth schema** (PTAGENT agent-level tables) continuing the OPAL decommission campaign.
+
 ---
 
 ## [2026-04-20] #ask_airflow Not Indexed in Captain's Slack Search

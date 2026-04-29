@@ -63,6 +63,12 @@ Additional clusters: Test, Lasso, Load-test (all prod-ltx1), GHD (grid1 - integr
 - **DAG PVC**: airflow-holdem-dags-pvc (1Gi)
 - **Logs PVC**: airflow-holdem-logs-pvc
 
+### Pod Topology Spreading (since Apr 2026)
+
+All Airflow pods (schedulers, dag-processors, webservers) are spread across **maintenance zones** by default via `topologySpreadConstraints` with `topology.kubernetes.io/zone` key, `maxSkew: 1`, and `whenUnsatisfiable: ScheduleAnyway`. This prevents a single zone maintenance event from taking down all instances of a component simultaneously.
+
+Source: deployment PR #1062 (2026-04-28).
+
 ### Purpose
 Primary offline and batch workload processing. Highest resource allocation reflects the volume and complexity of batch DAGs. Less frequent DAG reloading (1800s, 24hr) compared to Faro/War optimizes for stable, long-running batch jobs.
 

@@ -11,8 +11,9 @@ As of late April 2026 (BDP-98089), Oklahoma-Airflow has migrated from **CRT** (C
 3. **PR #1066** (Apr 27): **Re-onboarded** to LCD with simpler config to validate migration.
 4. **PR #1067** (Apr 27): Fixed LCD pipeline creation failure from PR #1066 (comment trigger).
 5. **PR #1070** (Apr 27): **Disabled EKG/canary steps** in LCD configuration — the definitive fix. ArgoCD-deployed MPs cannot use EKG/Canary.
+6. **PR #1062** (Apr 28): **Spread Airflow pods across maintenance zones** by default via `topologySpreadConstraints`. Prevents a single zone maintenance event from taking down all schedulers, dag-processors, or webservers simultaneously.
 
-**Current state**: LCD is the active deployment path with EKG/canary steps disabled. The CRT flow documented below remains as reference and may still be used for some operations during the transition period.
+**Current state**: LCD is the active deployment path with EKG/canary steps disabled. Pod topology spreading is now the default for all clusters. The CRT flow documented below remains as reference and may still be used for some operations during the transition period.
 
 ---
 
@@ -172,6 +173,9 @@ Runs a `DagBag` import against your local DAGs src directory and checks that eve
 | #676 | Fix `enforce_policy` satellite venv syspath | Discovers Python version dynamically instead of hardcoding `python3.10/site-packages` |
 | #677 | Silence noisy third-party library logs from CLI output | Every command (including `--help`) was flooding stdout with third-party log noise |
 | #678 | Initialize Airflow as isolated library using `settings.initialize()` | Proper initialization removes fragile behavior, maintenance burden, and broken local dev |
+| #684 | Normalize project_name for `.okl_setup.json` Python package path | Hyphenated Gradle module names (e.g., `venice-metadata-workflows`) caused `FileNotFoundError` because `project_name` wasn't normalized to underscores for the Python path |
+| #685 | Add `validate-dags` and `enforce-policy` hyphenated aliases | Both `-` and `_` forms now work (consistent with `crt-sync`, `rdev-init`). Also suppresses noisy `POLICY_PLUGIN_MANAGER` log errors by calling `settings.configure_logging()` |
+| #686 | Fix `crt-sync` for hyphenated app names | `get_airflow_clusters` was not normalizing hyphens to underscores for MP folder names, causing `FileNotFoundError` for apps like `venice-metadata-workflows` |
 
 ### LCD Migration Gotchas
 

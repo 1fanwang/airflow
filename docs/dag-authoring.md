@@ -26,7 +26,7 @@ Grid Gateway operators enable distributed execution of jobs on LinkedIn's Grid i
 | **AmbryPushOperator** | Push blobs to Ambry storage | `proxy_user`, grid_gateway_params | LinkedIn blob store integration. |
 | **VenicePushOperator** | Push data to Venice KV store | `proxy_user`, grid_gateway_params | Streaming store integration. |
 | **WormholePushOperator** | Push to Wormhole data platform | `proxy_user`, grid_gateway_params | Generic push operator. |
-| **DarwinOperator** | Darwin ML platform execution | `proxy_user`, grid_gateway_params | ML job orchestration on Grid. |
+| **DarwinOperator** | Darwin ML platform execution | `proxy_user`, grid_gateway_params, `disruption_ready` (bool, since Apr 2026) | ML job orchestration on Grid. Now supports disruption readiness (PR #1193, 2026-04-21) — assigns `_external_job_id` after `start_execution` for checkpoint resume. |
 | **FlyteOperator** | Flyte workflow execution | `proxy_user`, grid_gateway_params | Flyte task submission via Grid Gateway. |
 | **InDBTJobTypeOperator** | Execute dbt models in-database | `proxy_user`, grid_gateway_params | Distributed dbt execution. |
 | **GridGatewayOperator** | Generic Grid Gateway job (fallback) | `proxy_user`, `function_name`, `grid_gateway_params` | Direct function invocation. Use specific operators when available. |
@@ -76,7 +76,7 @@ Grid Gateway operators enable distributed execution of jobs on LinkedIn's Grid i
 - **`enable_sts_token`** (bool, default: False): Use STS token for DataVault authentication.
 - **`image_url`** (str, optional): Custom container image URL for job execution.
 - **`disruption_ready`** (bool, default: False): Enable disruption-ready retry policy for ENVIRONMENT_* errors.
-  - Supported functions: `hadoopJava`, `java`, `javaprocess`, `command`, `hadoopShell`.
+  - Supported functions: `hadoopJava`, `java`, `javaprocess`, `command`, `hadoopShell`, **`darwin`** (added Apr 2026, lipy-airflow-providers PR #1193).
   - Applies: `maxRetries: 3` on ENVIRONMENT_* error codes.
 - **`allow_rdev_runs`** (bool, default: True): Skip execution in rdev to preserve prod data stores.
 - **`enable_job_checkpoint`** (bool, default: True): Persist external job state on pod disruption.
@@ -170,9 +170,10 @@ Key improvements from recent commits:
    - Supported via `_overridable_attrs_map` on each operator.
    - See [Config Override docs](https://airflow-docs.corp.linkedin.com) for supported operators and fields.
 
-8. **`use_hourly_for_daily` Partition Sensor Support** (lipy PR #1158, 2026-04-09):
+8. **`use_hourly_for_daily` Partition Sensor Support** (lipy PR #1158, 2026-04-09; **backported to 2.9.2** in PR #1200, 2026-04-23):
    - Daily datasets reading from hourly-partitioned source tables can now use `use_hourly_for_daily=True` in the hourly partition sensor.
    - Uses UMP calendar-day boundaries (`00`-`23`) instead of hour-anchored sliding windows for partition checks.
+   - Available on both `master` and `BR_REL_airflow-2.9.2` branches.
 
 9. **EmailOperator** (airflow-docs PR #252, 2026-04-11):
    - New documentation for `EmailOperator` with usage examples (basic, multiple recipients, attachments, HTML content).

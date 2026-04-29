@@ -164,11 +164,13 @@ These issues appear exclusively in the rdev (remote dev) environment. They repre
 | **picli login timeout / cert failure** | `picli test login` hangs or `Cannot fetch user cert` | ssh-ca-cli stale on local mac | From **local mac** (not rdev): `pkill -f ssh-ca-cli && ssh-ca-cli refresh` |
 | **rdev image too old** | `ImportError: /lib/libstdc++.so.6: cannot allocate memory in static TLS block` or `ImportError: libmariadb.so.3` | rdev created before March 4, 2026 | Delete and recreate rdev; then run `~/.okl_rdev/grid_setup.sh -g holdem`. APA-140407, APA-140417. **Quick fix** (if you can't recreate): `pip install --force-reinstall --no-binary mysqlclient mysqlclient==2.2.4` or `yum install -y mariadb-connector-c`, then restart. |
 | **rdev image pinned** | Recurring import/cert issues despite recent creation | `devcontainer.json` pins `airflow-main-airflow-rdev:0.0.xyz` | Change to `airflow-main-airflow-rdev:stable` and rebuild |
+| **rdev image references deprecated repo name** | RDev silently uses stale image; imports fail or certs mismatch | `devcontainer.json` references old `oklahoma-airflow/airflow-main-airflow-rdev` instead of `oklahoma-airflow-deployment` | Update image path in `.devcontainer/devcontainer.json` to use `oklahoma-airflow-deployment`. A build-time warning was added in deployment PR #1052 (2026-04-22). |
 | **No DAGs in UI** | Empty DAG list, 0 DAGs after starting rdev | `okl-rdev-init.sh` not run or run without `-r` | `okl-rdev-init.sh -d <dag_source_dir> -r` then `~/.okl_rdev/restart_airflow.sh` |
 | **grid_gateway_service_default missing** | `GridGatewayConnectionSettingNotFound` on first GGW task | Grid setup not run after rdev creation | `~/.okl_rdev/grid_setup.sh -g holdem` |
 | **INVALID_ARGUMENT: Tag(pool,...) not allowed** | GGW rejects submission with tag error | `target_grid_cluster` not set in operator despite `-g faro` in picli login | Add `target_grid_cluster="faro"` to SparkBatchOperator |
 | **Invalid login on rdev Airflow UI** | Login page rejects credentials | Admin user not created in rdev DB | Inside rdev: `airflow users create --role Admin --username <ldap> ... --password <ldap>` then `~/.okl_rdev/restart_airflow.sh` |
 | **rdev tasks hitting prod** | Jobs unexpectedly appear in production clusters | No built-in safeguard in rdev | Use oklahoma-config-system to separate rdev vs. prod config. APA-143327. |
+| **WEAVER_URLS override removed** | Fabric/Weaver calls in rdev may behave differently after PR #1063 | `WEAVER_URLS` was removed from rdev env setup because it caused Fabric/Weaver to use a stale endpoint | This is expected — the override was removed (deployment PR #1063, 2026-04-24) because it was only used internally by `lipy-fabric` and the hardcoded value caused failures (DEPEND-102101). If your DAG breaks after updating rdev, check if it relied on the old Weaver endpoint. |
 
 ---
 
@@ -320,6 +322,38 @@ From `airflow.providers.lnkd.exceptions`:
 | **metrics_stop 500 on rate-limited request** | HTTP 500 from webserver; `AttributeError: 'g' has no attribute 'start_time'` in webserver logs | Check if the request was rate-limited by Flask-Limiter (429 status) | Fixed in deployment PR #1068 (2026-04-27). `metrics_stop` now guards against missing `g.start_time`. |
 
 **Root cause**: Flask-Limiter raises `RateLimitExceeded` during `before_request`, which aborts the rest of the `before_request` chain. This means `metrics_start` never runs and `g.start_time` is never set. `metrics_stop` then crashes with `AttributeError` when trying to access `g.start_time`, converting the 429 rate-limit response into a 500 server error.
+
+---
+
+### 13. DAG Run Deadlock Detection (Added Apr 2026)
+
+| Failure Type | Signature | Debug Path | Fix / Mitigation |
+|---|---|---|---|
+| **dagrun.deadlocked** | `dagrun.deadlocked` metric incremented; DAG run state transitions to `failed` | Check `dagrun.deadlocked` metric in MDM/Grafana with `dag_id` tag. Inspect task dependencies for circular waits or all-unfinished-but-none-schedulable states. | Fix the DAG's task dependency graph to eliminate deadlock conditions. |
+
+**Root cause**: All tasks in a DAG run are unfinished but none are schedulable — a task deadlock. Previously, Airflow failed the DAG run silently with no metric emission, making deadlock-induced failures invisible in error-rate dashboards.
+
+**New metric**: `Stats.incr("dagrun.deadlocked", tags=self.stats_tags)` — emitted when the scheduler detects the deadlock condition. Use this to alert on DAGs with structural dependency issues.
+
+Source: airflow fork PR #120 (2026-04-23).
+
+---
+
+### Kusto Airflow Logs Reference
+
+Airflow pod logs are queryable via Azure Data Explorer (Kusto). Four cluster/database combos hold Airflow logs:
+
+| Cluster | Database | Covers |
+|---------|----------|--------|
+| `inlogseiplatform` | `Kubernetes` | EI/staging (Faro) Kubernetes pod logs |
+| `inlogseiplatform` | `Oklahoma` | EI/staging (Faro) Airflow application logs |
+| `inlogsliprod` | `Kubernetes` | Production (Holdem, War) Kubernetes pod logs |
+| `inlogsliprod` | `Oklahoma` | Production (Holdem, War) Airflow application logs |
+| `inlogscorpplatform` | `Kubernetes` | Corp cluster Kubernetes pod logs |
+
+**Corp cluster**: The corp Airflow webserver pods log to the `inlogscorpplatform` cluster under the `Kubernetes` database. Added 2026-04-27 (deployment PR #1069).
+
+Source: deployment PR #1056 (2026-04-22), deployment PR #1069 (2026-04-27).
 
 ---
 

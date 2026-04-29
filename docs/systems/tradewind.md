@@ -193,6 +193,9 @@ Key commits (last 60):
 - Atomic deploy endpoint with worker placement
 - SSO integration
 
+**Late April 2026 additions (cont'd):**
+- **Airflow DB client module** (PR #71, 2026-04-23): New `clients/airflow_db.py` module extracting all direct Airflow DB operations from `repin_poller.py` into a dedicated client. `_get_airflow_engine`: cached, SSL-aware engine factory; resolves DSN from cfg2 for prod clusters. `_DEV_DSN_MAP`: Python constant for dev cluster DSNs. E2E test documentation also added.
+
 **Late April 2026 additions:**
 - **Navbar user badge and timezone-aware clock** (PR #79, 2026-04-24): `/api/v1/logged-in-user` endpoint returning authenticated username from Trust Bridge `x-authn-username` header (falls back to `$USER` in dev). `ClockDropdown` in navbar: live `HH:MM TZ (+/-HH:MM)` clock with UTC / Local / custom IANA timezone picker; selection persists across sessions.
 - **Announcement banners** (PR #80, 2026-04-24): Admin-controlled announcement banners at top of DAG list, mirroring Oklahoma Airflow's `OKLAHOMA_INFOS`/`OKLAHOMA_WARNINGS`/`OKLAHOMA_ALERTS` mechanism. Operators set `tradewind.announce_infos`, `tradewind.announce_warnings`, and `tradewind.announce_errors` in cfg2 config.
