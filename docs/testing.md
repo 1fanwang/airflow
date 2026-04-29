@@ -104,3 +104,17 @@ For now, use the testing infrastructure outside of tox directly.
 ## Running Tests with Tox
 
 Tox is available via `uv tool run tox` (not installed directly). However, the configured test environments (test310, test311, test312) currently have empty command definitions (`skip_install=True`, `commands=<empty>`), making them no-ops. The actual test execution may be defined elsewhere (e.g., Breeze scripts, pytest configuration, or CI workflows). Use `uv tool run tox list` to see available environments and `uv tool run tox config -e <env>` to inspect environment details.
+
+## Tox Configuration Status
+
+The project includes a `tox.ini` file that defines test environments (`test310`, `test311`, `test312`, `prepare`, `ci`). However, as of the last check:
+
+- **Tox availability**: Tox 4.53.0 is available via `uv tool run tox` (not installed directly, but managed by uv)
+- **Environment status**: The test environments are defined in envlist but are **currently empty**:
+  - `base_python = python3.12`
+  - `skip_install = True`
+  - No `commands` defined (commands, commands_pre, commands_post are empty)
+  - No `deps` specified
+- **Running tests**: Use `uv tool run tox run -e test310` to execute, but note that no actual test commands are currently configured in the tox environment specifications
+
+To use tox for testing, the environment configurations need to be populated with proper test commands and dependencies.
