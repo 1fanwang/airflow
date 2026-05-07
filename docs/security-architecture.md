@@ -159,6 +159,41 @@ WHERE r.name LIKE '%git-dali%' AND vm.name LIKE 'DAG:%';
 | `ab_permission_view` | Maps permissions to resources |
 | `ab_permission_view_role` | Maps permission-resource pairs to roles |
 
+### API Client — `OklahomaConfig` Auth Modes
+
+`linkedin.oklahomaclientlibrary.oklahoma_client.OklahomaConfig` (in the `airflow-client` MP) is the standard Python client for prod Airflow API access. It supports three auth modes — **only the first two work on prod clusters**:
+
+| Mode | How to enable | Where it works |
+|------|---------------|----------------|
+| **Cert-based DV mint (recommended)** | Pass `certificate_filepath` + `key_filepath`, leave `username`/`password` unset | All prod clusters (Holdem/War/Faro/Corp) — produces a `ServicePrincipal` token, auto-grants `LI_BASE_USER` |
+| **Pre-minted DV token** | Pass `api_key={'DataVaultAuth': '<token>'}`, leave `username`/`password` unset | All prod clusters — caller is responsible for minting and refreshing |
+| **Username/password (rdev only)** | Pass `username` + `password` | rdev only (DB-fallback auth). **Silently 401s on prod** — see below. |
+
+**The username/password trap**: at `oklahoma_client.py:51`, `useDVAuth` is True only when *both* `username` and `password` are `None`:
+
+```python
+self.useDVAuth: bool = self.username is None and self.password is None
+```
+
+When `useDVAuth` is False, the client never mints a DV token and never sets the `datavaultIdentityToken` header. The OpenAPI base class falls back to HTTP Basic auth (`Authorization: Basic <base64>`), which `linkedin.airflow.security.api_auth` does not read. Result: every prod request 401s, regardless of how correct the rest of the configuration is. This is the `OklahomaConfig` half of the same trap as the headless-`svc-*` UserPrincipal path documented above.
+
+**Working prod example (cert-based)**:
+
+```python
+from linkedin.oklahomaclientlibrary.oklahoma_client import OklahomaConfig, OklahomaClient
+
+config = OklahomaConfig(
+    host="https://holdem.oklahoma-airflow.grid.linkedin.com",
+    certificate_filepath="/path/to/svc-account.cert",  # service identity cert (Grestin-provisioned)
+    key_filepath="/path/to/svc-account.key",
+)
+# client.update_params_for_auth() will mint and inject the DV token on each request
+```
+
+If your service identity cert isn't already provisioned at your runtime, file a Grestin request — paths typically land under `/var/cluster/oklahoma/identity.{cert,key}` for Oklahoma-deployed services, or wherever your service ops mounts them. Default lookup if `certificate_filepath`/`key_filepath` are unset is `~/identity.cert` / `~/identity.key` (`utils.py:38-40`).
+
+**Reference**: APA-145542 (2026-05-07) — service account stuck on 401 because its MP was passing `username`/`password` to `OklahomaConfig` against Holdem.
+
 ---
 
 ## Authentication

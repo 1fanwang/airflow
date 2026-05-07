@@ -374,6 +374,30 @@ Jeeves automatically generates PRs to remove `LI_BASE_USER` from `access_control
 
 ---
 
+## [Slack-sourced 2026-05-07] `OklahomaConfig(username, password)` Silently Disables DV Token Minting
+
+**Where**: `linkedin.oklahomaclientlibrary.oklahoma_client.OklahomaConfig` (in `airflow-client` MP), used by service-account clients calling prod Airflow REST APIs
+
+**What happens**:
+`OklahomaConfig.useDVAuth` is set to True *only* when both `username` and `password` are `None` (`oklahoma_client.py:51`). When a caller passes `OklahomaConfig(host=..., username='svc-foo', password='...')`, `useDVAuth` flips to False, the client never mints a DV token, and the underlying OpenAPI base class falls back to HTTP Basic auth. Prod Airflow's `linkedin.airflow.security.api_auth` backend doesn't read Basic auth — only `datavaultIdentityToken` header or gunicorn-socket Grestin cert — so every prod request 401s. The 401 is the *same shape* as having no auth header at all, which makes it look like a token problem rather than a config problem.
+
+**How to avoid / fix**:
+- For prod (Holdem/War/Faro/Corp): always pass `certificate_filepath` + `key_filepath` (service identity cert + key) and **leave `username`/`password` unset**. Default lookup if not set is `~/identity.cert` / `~/identity.key` (`utils.py:38-40`).
+  ```python
+  OklahomaConfig(
+      host="https://holdem.oklahoma-airflow.grid.linkedin.com",
+      certificate_filepath="/path/to/svc-foo.cert",
+      key_filepath="/path/to/svc-foo.key",
+  )
+  ```
+- Alternative: pass a pre-minted DV token via `api_key={'DataVaultAuth': '<token>'}` and leave `username`/`password` unset.
+- The `username`/`password` parameters are only meaningful for rdev/local Airflow with DB auth fallback. They have never worked on prod; the silent fallback to Basic auth is the trap.
+- See `docs/security-architecture.md` "API Client — OklahomaConfig Auth Modes" for the full table.
+
+**Cross-link**: same root failure shape as the `svc-*` UserPrincipal path on the server side — both paths skip `LI_BASE_USER` assignment / DV token minting because they don't go through the cert-based ServicePrincipal flow.
+
+---
+
 ## [Slack-sourced 2026-04-13] AirflowSkipException Behavior Change Between Provider Versions
 
 **Where**: `lipy-airflow-providers`, `pre_execute` skip logic, versions 0.0.867 → 0.0.881
