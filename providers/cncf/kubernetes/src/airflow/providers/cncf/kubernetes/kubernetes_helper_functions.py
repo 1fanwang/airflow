@@ -60,13 +60,17 @@ API_RETRY_WAIT_MAX = conf.getfloat("workers", "api_retry_wait_max", fallback=15)
 _default_wait = tenacity.wait_exponential(min=API_RETRY_WAIT_MIN, max=API_RETRY_WAIT_MAX)
 
 TRANSIENT_STATUS_CODES = {409, 429, 500, 502, 503, 504}
+# Connection-level failures (socket reset, DNS blip, read timeout) worth retrying — the api server
+# never saw the request, or its reply was lost. Shared with KubernetesExecutor so this decorator and
+# the executor's re-queue agree on what counts as a transient connection error.
+TRANSIENT_CONNECTION_ERRORS: tuple[type[BaseException], ...] = (HTTPError, KubernetesApiException)
 
 
 def _should_retry_api(exc: BaseException) -> bool:
     """Retry on selected ApiException status codes, plus plain HTTP/timeout errors."""
     if isinstance(exc, (SyncApiException, AsyncApiException)):
         return exc.status in TRANSIENT_STATUS_CODES
-    return isinstance(exc, (HTTPError, KubernetesApiException))
+    return isinstance(exc, TRANSIENT_CONNECTION_ERRORS)
 
 
 class WaitRetryAfterOrExponential(tenacity.wait.wait_base):

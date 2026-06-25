@@ -49,7 +49,10 @@ from airflow.providers.cncf.kubernetes.executors.kubernetes_executor_types impor
     KubernetesResults,
 )
 from airflow.providers.cncf.kubernetes.kube_config import KubeConfig
-from airflow.providers.cncf.kubernetes.kubernetes_helper_functions import annotations_to_key
+from airflow.providers.cncf.kubernetes.kubernetes_helper_functions import (
+    TRANSIENT_CONNECTION_ERRORS,
+    annotations_to_key,
+)
 from airflow.providers.cncf.kubernetes.pod_generator import PodGenerator
 from airflow.providers.cncf.kubernetes.version_compat import AIRFLOW_V_3_0_PLUS
 from airflow.providers.common.compat.sdk import Stats, conf
@@ -402,6 +405,28 @@ class KubernetesExecutor(BaseExecutor):
                         e.__cause__,
                     )
                     self.fail(key, e)
+                except TRANSIENT_CONNECTION_ERRORS as e:
+                    # Connection-level failure talking to the api server (reset / DNS blip / read
+                    # timeout) — the category generic_api_retry treats as transient. Re-queue rather
+                    # than fail; the create may not have reached the server, so a later loop retries.
+                    key = task.key
+                    retries = self.task_publish_retries[key]
+                    if self.task_publish_max_retries == -1 or retries < self.task_publish_max_retries:
+                        self.log.warning(
+                            "[Try %s of %s] Transient connection error creating pod for Task %s: %r",
+                            retries + 1,
+                            self.task_publish_max_retries,
+                            key,
+                            e,
+                        )
+                        self.task_queue.put(task)
+                        self.task_publish_retries[key] = retries + 1
+                    else:
+                        self.log.error(
+                            "Connection error creating pod, retries exhausted. Failing task %s: %r", key, e
+                        )
+                        self.fail(key, e)
+                        self.task_publish_retries.pop(key, None)
                 finally:
                     self.task_queue.task_done()
 
