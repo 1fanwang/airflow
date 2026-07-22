@@ -228,6 +228,9 @@ class BaseExecutor(LoggingMixin):
         self.queued_connection_tests: dict[ConnectionTestKey, workloads.TestConnection] = {}
         self.running: set[WorkloadKey] = set()
         self.event_buffer: dict[WorkloadKey, EventBufferValueType] = {}
+        # AIP-97: structured failure context an executor classified for a key, read
+        # once by the scheduler when it processes the matching failure event.
+        self.task_failure_info: dict[WorkloadKey, Any] = {}
         self._task_event_logs: deque[Log] = deque()
         self.conf = ExecutorConf(team_name)
 
@@ -549,6 +552,17 @@ class BaseExecutor(LoggingMixin):
                     cleared_events[key] = self.event_buffer.pop(key)
 
         return cleared_events
+
+    def get_task_failure_info(self, key: WorkloadKey):
+        """
+        Return and clear the structured failure context this executor classified for ``key``.
+
+        AIP-97: an executor that can tell an infrastructure disruption from a task's own
+        failure (e.g. the Kubernetes executor reading a pod's ``OOMKilled`` vs ``Evicted``
+        reason) stashes a ``TaskFailureInfo`` here; the scheduler reads it once when it
+        processes the failure event. Returns None for executors that do not classify.
+        """
+        return self.task_failure_info.pop(key, None)
 
     def get_task_log(self, ti: TaskInstance, try_number: int) -> tuple[list[str], list[str]]:
         """

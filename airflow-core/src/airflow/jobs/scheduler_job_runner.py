@@ -1603,16 +1603,21 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 # AIP-97: the executor reported this task failed while the scheduler
                 # still had it QUEUED/RUNNING, i.e. the worker died from outside
                 # (eviction, OOM, node drain) without reporting an application error.
-                # Classify it as an infrastructure failure so the listener gets the
-                # context and the retry decision can refund the attempt.
+                # Prefer the executor's own classification when it supplied one — the
+                # Kubernetes bridge reads the real pod reason, so an Evicted pod is
+                # "infra" (refunded) while an app OOM against its own limit is "user"
+                # (not refunded). Fall back to a generic infra tag for executors that
+                # only report a state.
                 from airflow.listeners.types import TaskFailureInfo
 
-                failure_details = TaskFailureInfo(
-                    source="infra",
-                    executor_kind=type(executor).__name__,
-                    infra_reason="ExecutorReportedFailure",
-                    infra_metadata={"executor_state": str(state)},
-                )
+                failure_details = executor.get_task_failure_info(ti.key)
+                if failure_details is None:
+                    failure_details = TaskFailureInfo(
+                        source="infra",
+                        executor_kind=type(executor).__name__,
+                        infra_reason="ExecutorReportedFailure",
+                        infra_metadata={"executor_state": str(state)},
+                    )
                 ti.handle_failure(error=msg, session=session, failure_details=failure_details)
 
         cls._emit_executor_events_batch_metrics(num_events)

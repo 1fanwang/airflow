@@ -92,3 +92,18 @@ class TestToTaskFailureInfo:
         tfi = to_task_failure_info(details)
         assert tfi.source == "user"
         assert tfi.infra_reason == "OOMKilled"
+
+
+class TestExecutorFailureInfoSeam:
+    """The executor stashes a TaskFailureInfo; the scheduler reads it once (AIP-97 wiring)."""
+
+    def test_base_executor_seam_round_trips_once(self):
+        from airflow.executors.local_executor import LocalExecutor
+
+        ex = LocalExecutor()
+        key = ("dag", "task", "run", 1, -1)
+        tfi = to_task_failure_info({"pod_status": "Failed", "pod_reason": "Evicted"})
+        ex.task_failure_info[key] = tfi
+        # first read returns it, and clears it so a later event can't reuse stale context
+        assert ex.get_task_failure_info(key) is tfi
+        assert ex.get_task_failure_info(key) is None
