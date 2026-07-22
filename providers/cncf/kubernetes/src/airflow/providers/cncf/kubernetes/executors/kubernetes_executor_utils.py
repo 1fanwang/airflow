@@ -409,6 +409,57 @@ def collect_pod_failure_details(pod: k8s.V1Pod, logger) -> FailureDetails | None
         }
 
 
+# Pod/node-level reasons that mean the platform ended the pod (an infrastructure
+# disruption), as opposed to the container terminating on its own.
+_INFRA_FAILURE_REASONS = frozenset(
+    {
+        "Evicted",
+        "Preempting",
+        "NodeShutdown",
+        "Shutdown",
+        "NodeLost",
+        "TerminationByKubelet",
+        "DeletionByTaintManager",
+        "DisruptionTarget",
+    }
+)
+
+
+def to_task_failure_info(failure_details: FailureDetails | None):
+    """
+    Map Kubernetes ``FailureDetails`` to a core ``TaskFailureInfo`` (AIP-97).
+
+    Classifies the failure source so the listener and the retry decision can tell
+    an infrastructure disruption from the task's own failure. A node-level
+    disruption (eviction, preemption, node shutdown) is ``infra``. A container
+    that terminated on its own — an application crash, or an ``OOMKilled`` against
+    its *own* memory limit — is ``user``: the app's memory is the app's problem,
+    so it earns no infra refund. Returns None when there is nothing to classify or
+    when core is too old to carry the type.
+    """
+    if not failure_details:
+        return None
+    try:
+        from airflow.listeners.types import TaskFailureInfo
+    except ImportError:
+        return None
+
+    pod_reason = failure_details.get("pod_reason")
+    container_reason = failure_details.get("container_reason")
+
+    if pod_reason in _INFRA_FAILURE_REASONS or container_reason in _INFRA_FAILURE_REASONS:
+        source = "infra"
+    else:
+        source = "user"
+
+    return TaskFailureInfo(
+        source=source,
+        executor_kind="kubernetes",
+        infra_reason=pod_reason or container_reason,
+        infra_metadata=dict(failure_details),
+    )
+
+
 def _analyze_containers(
     container_statuses: list[k8s.V1ContainerStatus] | None, container_type: Literal["init", "main"]
 ) -> FailureDetails | None:
