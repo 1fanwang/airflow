@@ -538,6 +538,43 @@ def _date_or_empty(*, task_instance: TaskInstance, attr: str) -> str:
     return result.strftime("%Y%m%dT%H%M%S") if result else ""
 
 
+def _maybe_refund_infra_attempt(*, task_instance, task, failure_details) -> bool:
+    """
+    Refund one retry attempt (bump ``max_tries``) for an infra-classified failure (AIP-97).
+
+    Refunds only when the failure is classified ``source == "infra"``, config
+    ``[core] infra_failure_refund_retries`` is enabled, and fewer than
+    ``[core] max_infra_refunds`` refunds have already been granted. This is the
+    single safety gate: application/user/timeout failures and unclassified
+    (``failure_details is None``) failures never refund, so a real bug still
+    spends the user's retry budget. Returns True if an attempt was refunded.
+
+    :meta private:
+    """
+    if (
+        failure_details is None
+        or failure_details.source != "infra"
+        or task is None
+        or not conf.getboolean("core", "infra_failure_refund_retries", fallback=False)
+    ):
+        return False
+    max_infra_refunds = conf.getint("core", "max_infra_refunds", fallback=3)
+    refunds_used = max(task_instance.max_tries - task.retries, 0)
+    if refunds_used >= max_infra_refunds:
+        return False
+    task_instance.max_tries += 1
+    log.info(
+        "AIP-97: infra failure (%s) refunded attempt for %s; max_tries now %s "
+        "(refund %s/%s), user retry budget preserved",
+        failure_details.infra_reason,
+        task_instance,
+        task_instance.max_tries,
+        refunds_used + 1,
+        max_infra_refunds,
+    )
+    return True
+
+
 def uuid7() -> UUID:
     """Generate a new UUID7."""
     return uuid6.uuid7()
@@ -1874,25 +1911,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         # executor (`_is_pre_execution_failure` requeues "without consuming a task
         # retry") to the mid-execution case, now that `failure_details` can tell an
         # infra failure from a real crash. Gated by config, bounded by a cap.
-        if (
-            failure_details is not None
-            and failure_details.source == "infra"
-            and task is not None
-            and conf.getboolean("core", "infra_failure_refund_retries", fallback=False)
-        ):
-            max_infra_refunds = conf.getint("core", "max_infra_refunds", fallback=3)
-            refunds_used = max(ti.max_tries - task.retries, 0)
-            if refunds_used < max_infra_refunds:
-                ti.max_tries += 1
-                cls.logger().info(
-                    "AIP-97: infra failure (%s) refunded attempt for %s; max_tries now %s "
-                    "(refund %s/%s), user retry budget preserved",
-                    failure_details.infra_reason,
-                    ti,
-                    ti.max_tries,
-                    refunds_used + 1,
-                    max_infra_refunds,
-                )
+        _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_details=failure_details)
 
         if not ti.is_eligible_to_retry():
             ti.state = TaskInstanceState.FAILED
