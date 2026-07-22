@@ -24,7 +24,7 @@ from pluggy import HookspecMarker
 
 if TYPE_CHECKING:
     # These imports are for type checking only - no runtime dependency
-    from airflow.listeners.types import FailureDetails
+    from airflow.listeners.types import TaskFailureInfo
     from airflow.models.taskinstance import TaskInstance
     from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
     from airflow.utils.state import TaskInstanceState
@@ -53,7 +53,7 @@ def on_task_instance_failed(
     previous_state: TaskInstanceState | None,
     task_instance: RuntimeTaskInstance | TaskInstance,
     error: None | str | BaseException,
-    failure_details: FailureDetails | None,
+    failure_details: TaskFailureInfo | None,
 ):
     """
     Execute when task state changes to FAIL. previous_state can be None.

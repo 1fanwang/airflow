@@ -46,7 +46,7 @@ class AssetEvent:
 
 
 @attrs.define(frozen=True)
-class FailureDetails:
+class TaskFailureInfo:
     """
     Structured infrastructure-side failure context for ``on_task_instance_failed``.
 
@@ -71,6 +71,7 @@ class FailureDetails:
     against a fixed contract.
     """
 
-    executor_kind: str
+    source: str = "infra"
+    executor_kind: str | None = None
     infra_reason: str | None = None
     infra_metadata: dict[str, Any] = attrs.field(factory=dict)

@@ -1,4 +1,4 @@
-Add the ``FailureDetails`` value object and extend the ``on_task_instance_failed`` listener hook to accept it as a ``failure_details`` keyword argument (AIP-97 foundation).
+Add the ``TaskFailureInfo`` value object and extend the ``on_task_instance_failed`` listener hook to accept it as a ``failure_details`` keyword argument (AIP-97 foundation).
 
 Today the listener only sees the worker-side ``error`` exception; failure
 causes that originate outside the worker process — pod ``OOMKilled`` /
@@ -6,7 +6,7 @@ causes that originate outside the worker process — pod ``OOMKilled`` /
 oom-killer ``SIGKILL`` on the local executor — are visible only to the
 executor and never reach the listener.
 
-``FailureDetails`` is the executor-agnostic shape every executor populates
+``TaskFailureInfo`` is the executor-agnostic shape every executor populates
 when surfacing infrastructure failure causes. The ``executor_kind`` is the
 canonical executor name; ``infra_reason`` is the executor's short categorical
 token; ``infra_metadata`` carries any structured payload the executor wants
@@ -15,7 +15,7 @@ to ship.
 .. code-block:: python
 
     from airflow.listeners import hookimpl
-    from airflow.listeners.types import FailureDetails
+    from airflow.listeners.types import TaskFailureInfo
 
 
     class InfraTrackingListener:

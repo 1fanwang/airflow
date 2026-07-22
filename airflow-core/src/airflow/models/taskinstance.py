@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.elements import ColumnElement
 
     from airflow.api_fastapi.execution_api.datamodels.asset import AssetProfile
+    from airflow.listeners.types import TaskFailureInfo
     from airflow.models.dag import DagModel
     from airflow.models.dagrun import DagRun
     from airflow.serialization.definitions.dag import SerializedDAG
@@ -1823,6 +1824,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         *,
         session: Session,
         fail_fast: bool = False,
+        failure_details: TaskFailureInfo | None = None,
     ):
         """
         Fetch the context needed to handle a failure.
@@ -1832,6 +1834,9 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         :param test_mode: doesn't record success or failure in the DB if True
         :param session: SQLAlchemy ORM Session
         :param fail_fast: if True, fail all downstream tasks
+        :param failure_details: structured failure context when the failure originated
+            outside the worker (AIP-97). When ``source == "infra"`` the attempt is
+            refunded rather than charged to the user's retry budget, gated by config.
         """
         if error:
             cls.logger().error("%s", error)
@@ -1863,6 +1868,32 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         # Actual callbacks are handled by the DAG processor, not the scheduler
         task = getattr(ti, "task", None)
 
+        # AIP-97 Pillar 2: an infrastructure-classified failure (pod eviction, OOM,
+        # worker death) refunds the attempt instead of spending the user's retry
+        # budget. This extends the existing pre-execution behavior in the Kubernetes
+        # executor (`_is_pre_execution_failure` requeues "without consuming a task
+        # retry") to the mid-execution case, now that `failure_details` can tell an
+        # infra failure from a real crash. Gated by config, bounded by a cap.
+        if (
+            failure_details is not None
+            and failure_details.source == "infra"
+            and task is not None
+            and conf.getboolean("core", "infra_failure_refund_retries", fallback=False)
+        ):
+            max_infra_refunds = conf.getint("core", "max_infra_refunds", fallback=3)
+            refunds_used = max(ti.max_tries - task.retries, 0)
+            if refunds_used < max_infra_refunds:
+                ti.max_tries += 1
+                cls.logger().info(
+                    "AIP-97: infra failure (%s) refunded attempt for %s; max_tries now %s "
+                    "(refund %s/%s), user retry budget preserved",
+                    failure_details.infra_reason,
+                    ti,
+                    ti.max_tries,
+                    refunds_used + 1,
+                    max_infra_refunds,
+                )
+
         if not ti.is_eligible_to_retry():
             ti.state = TaskInstanceState.FAILED
 
@@ -1882,7 +1913,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
                 previous_state=TaskInstanceState.RUNNING,
                 task_instance=ti,
                 error=error,
-                failure_details=None,
+                failure_details=failure_details,
             )
         except Exception:
             log.exception("error calling listener")
@@ -1904,6 +1935,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         test_mode: bool | None = None,
         *,
         session: Session = NEW_SESSION,
+        failure_details: TaskFailureInfo | None = None,
     ) -> None:
         """
         Handle Failure for a task instance.
@@ -1911,6 +1943,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         :param error: if specified, log the specific exception if thrown
         :param test_mode: doesn't record success or failure in the DB if True
         :param session: SQLAlchemy ORM Session
+        :param failure_details: structured failure context when the failure originated
+            outside the worker (AIP-97), forwarded to the listener and the retry decision.
         """
         if TYPE_CHECKING:
             assert self.task
@@ -1927,6 +1961,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
             test_mode=test_mode,
             session=session,
             fail_fast=fail_fast,
+            failure_details=failure_details,
         )
 
         _log_state(task_instance=self)

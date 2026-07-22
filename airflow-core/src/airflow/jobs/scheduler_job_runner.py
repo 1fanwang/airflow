@@ -1600,7 +1600,20 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     executor.send_callback(email_request)
 
                 # Update task state - emails are handled by DAG processor now
-                ti.handle_failure(error=msg, session=session)
+                # AIP-97: the executor reported this task failed while the scheduler
+                # still had it QUEUED/RUNNING, i.e. the worker died from outside
+                # (eviction, OOM, node drain) without reporting an application error.
+                # Classify it as an infrastructure failure so the listener gets the
+                # context and the retry decision can refund the attempt.
+                from airflow.listeners.types import TaskFailureInfo
+
+                failure_details = TaskFailureInfo(
+                    source="infra",
+                    executor_kind=type(executor).__name__,
+                    infra_reason="ExecutorReportedFailure",
+                    infra_metadata={"executor_state": str(state)},
+                )
+                ti.handle_failure(error=msg, session=session, failure_details=failure_details)
 
         cls._emit_executor_events_batch_metrics(num_events)
         return len(event_buffer)
