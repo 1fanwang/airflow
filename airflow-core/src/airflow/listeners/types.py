@@ -69,9 +69,16 @@ class TaskFailureInfo:
     Wiring per executor is out of scope for the foundation: this type
     only defines the shape so each executor's surfacing PR can iterate
     against a fixed contract.
+
+    ``source`` is the closed discriminant — ``user`` (worker exception or
+    manual mark-failed), ``infra`` (executor-side death: eviction, OOM kill,
+    preemption, heartbeat loss), or ``timeout``. The foundation populates
+    ``infra`` on the worker-died path; the other sources arrive as executors
+    and the mark-failed path wire up. Preemption is ``infra`` with
+    ``infra_reason="preemption"``, not a separate source.
     """
 
-    source: str = "infra"
+    source: str = "infra"  # closed set: user | infra | timeout
     executor_kind: str | None = None
     infra_reason: str | None = None
     infra_metadata: dict[str, Any] = attrs.field(factory=dict)
