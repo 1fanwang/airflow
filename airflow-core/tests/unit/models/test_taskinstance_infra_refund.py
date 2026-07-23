@@ -68,6 +68,13 @@ class TestMaybeRefundInfraAttempt:
         assert _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_details=details) is False
         assert ti.max_tries == 1
 
+    @conf_vars(ENABLED)
+    def test_none_retries_does_not_crash_or_refund(self):
+        # retries=None (unset) must not raise TypeError in the cap math; treated as no budget.
+        ti, task = _FakeTI(max_tries=0), _FakeTask(retries=None)
+        assert _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_details=_infra()) is False
+        assert ti.max_tries == 0
+
     @conf_vars({("core", "infra_failure_refund_retries"): "False"})
     def test_disabled_by_default_does_not_refund(self):
         ti, task = _FakeTI(max_tries=1), _FakeTask(retries=1)

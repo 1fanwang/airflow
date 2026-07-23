@@ -551,15 +551,20 @@ def _maybe_refund_infra_attempt(*, task_instance, task, failure_details) -> bool
 
     :meta private:
     """
+    # ``retries`` may be None (unset) — treat it like is_eligible_to_retry does, as falsy.
+    # With no configured retries there is no user budget to protect, so refunding is a no-op
+    # (is_eligible_to_retry still fails the task); skip it and avoid a misleading log line.
+    retries = getattr(task, "retries", None) or 0
     if (
         failure_details is None
         or failure_details.source != "infra"
         or task is None
+        or not retries
         or not conf.getboolean("core", "infra_failure_refund_retries", fallback=False)
     ):
         return False
     max_infra_refunds = conf.getint("core", "max_infra_refunds", fallback=3)
-    refunds_used = max(task_instance.max_tries - task.retries, 0)
+    refunds_used = max((task_instance.max_tries or 0) - retries, 0)
     if refunds_used >= max_infra_refunds:
         return False
     task_instance.max_tries += 1

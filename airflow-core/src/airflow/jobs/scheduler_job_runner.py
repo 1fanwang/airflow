@@ -1405,6 +1405,11 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     job_id,
                 )
             state, info = event_buffer.pop(buffer_key)
+            # AIP-97: pop any executor-classified failure context for this event now, so the
+            # entry is always cleared when its event is processed — not only when the
+            # killed-externally branch below consumes it. Prevents unbounded growth from
+            # normally-failed (self-reporting) tasks whose events skip that branch.
+            executor_failure_details = executor.get_task_failure_info(ti.key)
 
             if state in (TaskInstanceState.QUEUED, TaskInstanceState.RUNNING):
                 ti.external_executor_id = info
@@ -1610,7 +1615,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 # only report a state.
                 from airflow.listeners.types import TaskFailureInfo
 
-                failure_details = executor.get_task_failure_info(ti.key)
+                failure_details = executor_failure_details
                 if failure_details is None:
                     failure_details = TaskFailureInfo(
                         source="infra",
