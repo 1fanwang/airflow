@@ -113,11 +113,17 @@ def _emit_state_listener_hooks(updated_tis: list[TI], new_state: str | TaskInsta
             if new_state == TaskInstanceState.SUCCESS:
                 get_listener_manager().hook.on_task_instance_success(previous_state=None, task_instance=ti)
             elif new_state == TaskInstanceState.FAILED:
+                # AIP-97 (POC): a user marking a task failed is a user-sourced failure, not an
+                # infra disruption. Populate failure_details(source="user") so a listener — and
+                # any resume/refund logic — can tell a deliberate mark-failed from an eviction,
+                # rather than receiving None and having to guess.
+                from airflow.listeners.types import TaskFailureInfo
+
                 get_listener_manager().hook.on_task_instance_failed(
                     previous_state=None,
                     task_instance=ti,
                     error=f"TaskInstance's state was manually set to `{TaskInstanceState.FAILED}`.",
-                    failure_details=None,
+                    failure_details=TaskFailureInfo(source="user", infra_reason="manually_set_to_failed"),
                 )
             elif new_state == TaskInstanceState.SKIPPED:
                 get_listener_manager().hook.on_task_instance_skipped(previous_state=None, task_instance=ti)
