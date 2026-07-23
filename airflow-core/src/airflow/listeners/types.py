@@ -43,3 +43,4 @@ class AssetEvent:
     source_aliases: list[SerializedAssetAlias]
     partition_key: str | None
     partition_date: datetime | None = None
+
