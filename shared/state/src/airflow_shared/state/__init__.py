@@ -72,6 +72,28 @@ class AssetScope:
 StoreScope = TaskScope | AssetScope
 
 
+class TaskFailureKind(str, Enum):
+    """
+    Categorical source of a task instance failure.
+
+    Lets a listener and the retry decision tell an infrastructure disruption
+    from the task's own failure without parsing the error.
+
+    ``INFRA`` — executor-side death outside the worker: eviction, OOM kill,
+    preemption, node drain, heartbeat loss.
+    ``USER`` — the task's own failure (a worker exception) or an explicit
+    manual mark-failed.
+    ``TIMEOUT`` — the task exceeded its ``execution_timeout``.
+    """
+
+    INFRA = "infra"
+    USER = "user"
+    TIMEOUT = "timeout"
+
+    def __str__(self) -> str:
+        return self.value
+
+
 class AssetStateStoreWriterKind(str, Enum):
     """
     Identifies what kind of writer last updated an asset state store entry.

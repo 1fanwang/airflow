@@ -551,6 +551,19 @@ class KubernetesExecutor(BaseExecutor):
                     container_message,
                     exit_code,
                 )
+
+                # Classify this pod failure (Evicted / OOMKilled / node
+                # shutdown / ...) into a (failure_kind, infra_reason) pair. The scheduler
+                # reads it via get_task_failure_info() and hands the kind to handle_failure,
+                # so an infra disruption is told from the task's own failure and the retry
+                # budget is charged accordingly. An app OOM against its own limit stays "user".
+                from airflow.providers.cncf.kubernetes.executors.kubernetes_executor_utils import (
+                    classify_pod_failure,
+                )
+
+                task_failure_kind = classify_pod_failure(failure_details)
+                if task_failure_kind is not None:
+                    self.task_failure_info[key] = task_failure_kind
             else:
                 task_key_str = f"{key.dag_id}.{key.task_id}.{key.try_number}"
                 self.log.warning(

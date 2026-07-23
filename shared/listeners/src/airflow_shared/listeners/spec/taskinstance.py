@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from airflow.models.taskinstance import TaskInstance
     from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
     from airflow.utils.state import TaskInstanceState
+    from airflow_shared.state import TaskFailureKind
 
 hookspec = HookspecMarker("airflow")
 
@@ -52,8 +53,37 @@ def on_task_instance_failed(
     previous_state: TaskInstanceState | None,
     task_instance: RuntimeTaskInstance | TaskInstance,
     error: None | str | BaseException,
+    failure_kind: TaskFailureKind | None,
 ):
-    """Execute when task state changes to FAIL. previous_state can be None."""
+    """
+    Execute when task state changes to FAIL. previous_state can be None.
+
+    :param previous_state: Previous state of the task instance (can be None)
+    :param task_instance: The task instance object
+    :param error: The exception that caused the failure (or human-readable
+        message string for API-driven manual transitions)
+    :param failure_kind: Categorical source of the failure —
+        ``TaskFailureKind.INFRA`` (executor-side death: eviction, OOM kill,
+        preemption, heartbeat loss), ``TaskFailureKind.USER`` (worker exception
+        or manual mark-failed), or ``TaskFailureKind.TIMEOUT``. ``None`` when the
+        source is not classified. It is a ``str`` enum, so it compares equal to
+        ``"infra"`` / ``"user"`` / ``"timeout"`` for listeners that prefer strings.
+
+        This is the lightweight discriminant, mirroring how ``error`` was
+        added to this hook. The structured executor detail (pod reason, exit
+        code) is persisted on the task instance row as ``infra_reason`` and
+        read off ``task_instance``, rather than shipped as a transient payload.
+
+        Pluggy dispatches by parameter name, so existing ``hookimpl``
+        implementations that don't declare ``failure_kind`` keep working
+        unchanged. Implementations that DO declare it must not assign a
+        default value — pluggy treats an impl-side default as authoritative
+        and silently overrides the value the caller passed. Declare it
+        without a default::
+
+            @hookimpl
+            def on_task_instance_failed(self, previous_state, task_instance, error, failure_kind): ...
+    """
 
 
 @hookspec

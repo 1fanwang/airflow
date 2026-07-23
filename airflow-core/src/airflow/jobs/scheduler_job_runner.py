@@ -56,6 +56,7 @@ from sqlalchemy.sql import expression
 
 from airflow import settings
 from airflow._shared.observability.metrics import stats
+from airflow._shared.state import TaskFailureKind
 from airflow._shared.timezones import timezone
 from airflow.api_fastapi.execution_api.datamodels.taskinstance import DagRun as DRDataModel, TIRunContext
 from airflow.assets.evaluation import AssetEvaluator
@@ -1405,6 +1406,12 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     job_id,
                 )
             state, info = event_buffer.pop(buffer_key)
+            # Pop any executor-classified failure kind for this event now, so the
+            # entry is always cleared when its event is processed — not only when the
+            # killed-externally branch below consumes it. Prevents unbounded growth from
+            # normally-failed (self-reporting) tasks whose events skip that branch.
+            # The side channel carries a (failure_kind, infra_reason) pair.
+            executor_failure_kind = executor.get_task_failure_info(ti.key)
 
             if state in (TaskInstanceState.QUEUED, TaskInstanceState.RUNNING):
                 ti.external_executor_id = info
@@ -1600,7 +1607,24 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     executor.send_callback(email_request)
 
                 # Update task state - emails are handled by DAG processor now
-                ti.handle_failure(error=msg, session=session)
+                # The executor reported this task failed while the scheduler still had
+                # it QUEUED/RUNNING, i.e. the worker died from outside without reporting
+                # an application error. Refund only when an executor positively classified
+                # the failure as infra — its bridge read the real cause (the Kubernetes
+                # bridge tells an Evicted pod from an app OOM against its own limit). An
+                # executor that only reports a state gives us no way to tell an eviction
+                # from a silent app crash, so the failure is left unclassified
+                # (failure_kind=None) and spends the user's retry exactly as today.
+                if executor_failure_kind is not None:
+                    failure_kind, infra_reason = executor_failure_kind
+                else:
+                    failure_kind, infra_reason = None, None
+                ti.handle_failure(
+                    error=msg,
+                    session=session,
+                    failure_kind=failure_kind,
+                    infra_reason=infra_reason if failure_kind == TaskFailureKind.INFRA else None,
+                )
 
         cls._emit_executor_events_batch_metrics(num_events)
         return len(event_buffer)

@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
     from airflow._shared.logging.remote import StreamingLogResponse
+    from airflow._shared.state import TaskFailureKind
     from airflow.api_fastapi.auth.tokens import JWTGenerator
     from airflow.callbacks.base_callback_sink import BaseCallbackSink
     from airflow.callbacks.callback_requests import CallbackRequest
@@ -228,6 +229,9 @@ class BaseExecutor(LoggingMixin):
         self.queued_connection_tests: dict[ConnectionTestKey, workloads.TestConnection] = {}
         self.running: set[WorkloadKey] = set()
         self.event_buffer: dict[WorkloadKey, EventBufferValueType] = {}
+        # The (failure_kind, infra_reason) pair an executor classified for a
+        # key, read once by the scheduler when it processes the matching failure event.
+        self.task_failure_info: dict[WorkloadKey, tuple[TaskFailureKind, str | None]] = {}
         self._task_event_logs: deque[Log] = deque()
         self.conf = ExecutorConf(team_name)
 
@@ -549,6 +553,17 @@ class BaseExecutor(LoggingMixin):
                     cleared_events[key] = self.event_buffer.pop(key)
 
         return cleared_events
+
+    def get_task_failure_info(self, key: WorkloadKey):
+        """
+        Return and clear the ``(failure_kind, infra_reason)`` this executor classified for ``key``.
+
+        An executor that can tell an infrastructure disruption from a task's own
+        failure (e.g. the Kubernetes executor reading a pod's ``OOMKilled`` vs ``Evicted``
+        reason) stashes a ``(failure_kind, infra_reason)`` pair here; the scheduler reads it
+        once when it processes the failure event. Returns None for executors that do not classify.
+        """
+        return self.task_failure_info.pop(key, None)
 
     def get_task_log(self, ti: TaskInstance, try_number: int) -> tuple[list[str], list[str]]:
         """
