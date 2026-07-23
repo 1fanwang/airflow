@@ -103,6 +103,27 @@ of a :class:`~airflow.sdk.execution_time.task_runner.RuntimeTaskInstance` instan
     :start-after: [START howto_listen_ti_skipped_task]
     :end-before: [END howto_listen_ti_skipped_task]
 
+Infrastructure failure context
+""""""""""""""""""""""""""""""
+
+``on_task_instance_failed`` accepts an optional ``failure_details`` argument, a
+:class:`~airflow.listeners.types.TaskFailureInfo`. When a task is killed from outside the worker
+process — a pod eviction, an OOM kill, a lost heartbeat — the ``error`` argument cannot carry the
+cause, because the worker never got to raise it. ``failure_details`` carries a ``source``
+(``user``, ``infra`` or ``timeout``) and, where the executor knows it, an ``infra_reason`` and
+``infra_metadata``. A listener that wants this context declares the argument:
+
+.. code-block:: python
+
+    @hookimpl
+    def on_task_instance_failed(self, previous_state, task_instance, error, failure_details):
+        if failure_details and failure_details.source == "infra":
+            ...  # an infrastructure disruption, not the task's own code
+
+``failure_details`` is ``None`` unless the executor classified the failure. A listener that does
+not declare the argument keeps working unchanged — the parameter is dispatched by name, so existing
+listeners need no migration.
+
 Asset Events
 --------------
 

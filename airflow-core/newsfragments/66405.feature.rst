@@ -1,0 +1,1 @@
+Add an opt-in infrastructure retry budget (``[core] infra_failure_refund_retries``, bounded by ``max_infra_refunds``) so an infra-classified failure — pod eviction, OOM kill, lost heartbeat — does not spend a task's ``retries``; disabled by default.
