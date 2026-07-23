@@ -14,9 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-from __future__ import annotations
+"""AIP-97 POC: dedicated infra counter — max_tries stays pristine, a separate bounded counter tracks infra."""
 
-import pytest
+from __future__ import annotations
 
 from airflow.listeners.types import TaskFailureInfo
 from airflow.models.taskinstance import _maybe_refund_infra_attempt
@@ -25,15 +25,16 @@ from tests_common.test_utils.config import conf_vars
 
 
 class _FakeTI:
-    def __init__(self, max_tries: int):
+    def __init__(self, max_tries: int, infra_retry_count: int = 0):
         self.max_tries = max_tries
+        self.infra_retry_count = infra_retry_count
 
     def __str__(self) -> str:
         return "<FakeTI>"
 
 
 class _FakeTask:
-    def __init__(self, retries: int):
+    def __init__(self, retries):
         self.retries = retries
 
 
@@ -44,55 +45,50 @@ def _infra(reason: str = "Evicted") -> TaskFailureInfo:
 ENABLED = {("core", "infra_failure_refund_retries"): "True", ("core", "max_infra_refunds"): "3"}
 
 
-class TestMaybeRefundInfraAttempt:
-    """The single safety gate: only an infra-classified failure, with the flag on and under the cap, refunds."""
+class TestDedicatedInfraCounter:
+    """The counter increments on infra; ``max_tries`` is never touched; the cap bounds it."""
 
     @conf_vars(ENABLED)
-    def test_infra_failure_refunds_one_attempt(self):
+    def test_infra_bumps_counter_not_max_tries(self):
         ti, task = _FakeTI(max_tries=1), _FakeTask(retries=1)
         assert _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_details=_infra()) is True
-        assert ti.max_tries == 2
+        assert ti.infra_retry_count == 1
+        assert ti.max_tries == 1  # pristine — still == retries
 
     @conf_vars(ENABLED)
-    def test_app_failure_does_not_refund(self):
-        # failure_details=None is the ordinary worker-exception path — a real bug must spend the budget.
+    def test_cap_bounds_the_counter_and_leaves_max_tries_pristine(self):
+        # retries=1, cap=3 -> counter goes 1,2,3 then stops; max_tries never moves.
         ti, task = _FakeTI(max_tries=1), _FakeTask(retries=1)
-        assert _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_details=None) is False
-        assert ti.max_tries == 1
-
-    @conf_vars(ENABLED)
-    @pytest.mark.parametrize("source", ["user", "timeout"])
-    def test_non_infra_source_does_not_refund(self, source):
-        ti, task = _FakeTI(max_tries=1), _FakeTask(retries=1)
-        details = TaskFailureInfo(source=source)
-        assert _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_details=details) is False
-        assert ti.max_tries == 1
-
-    @conf_vars(ENABLED)
-    def test_none_retries_does_not_crash_or_refund(self):
-        # retries=None (unset) must not raise TypeError in the cap math; treated as no budget.
-        ti, task = _FakeTI(max_tries=0), _FakeTask(retries=None)
-        assert _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_details=_infra()) is False
-        assert ti.max_tries == 0
-
-    @conf_vars({("core", "infra_failure_refund_retries"): "False"})
-    def test_disabled_by_default_does_not_refund(self):
-        ti, task = _FakeTI(max_tries=1), _FakeTask(retries=1)
-        assert _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_details=_infra()) is False
-        assert ti.max_tries == 1
-
-    @conf_vars(ENABLED)
-    def test_cap_bounds_the_refunds(self):
-        # retries=1, cap=3 → refunds allowed only while (max_tries - retries) < 3, i.e. max_tries in {1,2,3}.
-        ti, task = _FakeTI(max_tries=1), _FakeTask(retries=1)
-        assert [
+        results = [
             _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_details=_infra())
             for _ in range(5)
-        ] == [
-            True,
-            True,
-            True,
-            False,
-            False,
         ]
-        assert ti.max_tries == 4  # 1 + three refunds, then capped
+        assert results == [True, True, True, False, False]
+        assert ti.infra_retry_count == 3
+        assert ti.max_tries == 1  # never inflated, unlike the refund approach
+
+    @conf_vars(ENABLED)
+    def test_app_and_user_and_timeout_never_count(self):
+        ti, task = _FakeTI(max_tries=1), _FakeTask(retries=1)
+        assert _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_details=None) is False
+        for source in ("user", "timeout"):
+            assert (
+                _maybe_refund_infra_attempt(
+                    task_instance=ti, task=task, failure_details=TaskFailureInfo(source=source)
+                )
+                is False
+            )
+        assert ti.infra_retry_count == 0
+        assert ti.max_tries == 1
+
+    @conf_vars({("core", "infra_failure_refund_retries"): "False"})
+    def test_disabled_by_default_does_not_count(self):
+        ti, task = _FakeTI(max_tries=1), _FakeTask(retries=1)
+        assert _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_details=_infra()) is False
+        assert ti.infra_retry_count == 0
+
+    @conf_vars(ENABLED)
+    def test_none_retries_does_not_crash_or_count(self):
+        ti, task = _FakeTI(max_tries=0), _FakeTask(retries=None)
+        assert _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_details=_infra()) is False
+        assert ti.infra_retry_count == 0

@@ -564,18 +564,19 @@ def _maybe_refund_infra_attempt(*, task_instance, task, failure_details) -> bool
     ):
         return False
     max_infra_refunds = conf.getint("core", "max_infra_refunds", fallback=3)
-    refunds_used = max((task_instance.max_tries or 0) - retries, 0)
-    if refunds_used >= max_infra_refunds:
+    # POC: a DEDICATED counter. max_tries is never touched — it stays == task.retries. An infra
+    # attempt bumps its own bounded counter, and is_eligible_to_retry adds it to the ceiling.
+    if (task_instance.infra_retry_count or 0) >= max_infra_refunds:
         return False
-    task_instance.max_tries += 1
+    task_instance.infra_retry_count = (task_instance.infra_retry_count or 0) + 1
     log.info(
-        "AIP-97: infra failure (%s) refunded attempt for %s; max_tries now %s "
-        "(refund %s/%s), user retry budget preserved",
+        "AIP-97: infra failure (%s) counted for %s; infra_retry_count now %s/%s, "
+        "max_tries unchanged at %s (== retries), user retry budget preserved",
         failure_details.infra_reason,
         task_instance,
-        task_instance.max_tries,
-        refunds_used + 1,
+        task_instance.infra_retry_count,
         max_infra_refunds,
+        task_instance.max_tries,
     )
     return True
 
@@ -622,6 +623,9 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
     state: Mapped[str | None] = mapped_column(String(20), nullable=True)
     try_number: Mapped[int] = mapped_column(Integer, default=0)
     max_tries: Mapped[int] = mapped_column(Integer, server_default="-1")
+    # AIP-97 (POC): a dedicated infra-attempt counter kept separate from max_tries, so an
+    # infrastructure disruption never mutates the user's retry number. See is_eligible_to_retry.
+    infra_retry_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     hostname: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     unixname: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     pool: Mapped[str] = mapped_column(String(256), nullable=False)
@@ -2007,6 +2011,12 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
             assert self.task
             assert self.task.retries
 
+        # POC (AIP-97 dedicated counter): the effective ceiling is the user's max_tries plus the
+        # infra attempts counted separately. max_tries stays == task.retries; infra disruptions
+        # extend eligibility without ever inflating the user's number.
+        effective_max_tries = self.max_tries + (self.infra_retry_count or 0)
+        if self.infra_retry_count and self.try_number <= effective_max_tries:
+            return True
         return bool(self.task.retries and self.try_number <= self.max_tries)
 
     def set_duration(self) -> None:
