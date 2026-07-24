@@ -1,0 +1,31 @@
+Add a ``failure_kind`` argument to the ``on_task_instance_failed`` listener hook and an ``infra_reason`` column on the task instance, so a listener can tell an infrastructure disruption from the task's own failure (AIP-97 foundation).
+
+Today the listener only sees the worker-side ``error`` exception; failure
+causes that originate outside the worker process — pod ``OOMKilled`` /
+``PodEvicted`` on Kubernetes, a lost heartbeat, an oom-killer ``SIGKILL`` on
+the local executor — look the same as a real bug.
+
+``failure_kind`` is a small ``TaskFailureKind`` enum (a ``str`` enum, so it
+compares equal to ``"infra"`` / ``"application"`` / ``"timeout"`` / ``"manual"``). The executor's
+short reason token (``OOMKilled`` / ``Evicted`` / ...) is persisted on the
+task instance row as ``infra_reason`` and read off ``task_instance``, rather
+than shipped as a transient payload.
+
+.. code-block:: python
+
+    from airflow.listeners import hookimpl
+
+
+    class InfraTrackingListener:
+        @hookimpl
+        def on_task_instance_failed(self, previous_state, task_instance, error, failure_kind):
+            if failure_kind == "infra":
+                # route task_instance.infra_reason to a capacity-planning alert
+                ...
+
+The Kubernetes executor classifies a failed pod: a node-level disruption
+(``Evicted`` / ``Preempting`` / ``NodeShutdown`` / ...) is ``"infra"``; a
+container that ended on its own — an app crash, or an ``OOMKilled`` against
+its *own* limit — is ``"application"``. pluggy dispatches by parameter name, so
+existing ``hookimpl`` implementations that don't declare ``failure_kind`` keep
+working unchanged.

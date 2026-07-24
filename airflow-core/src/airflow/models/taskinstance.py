@@ -75,6 +75,7 @@ from airflow._shared.observability.traces import (
     new_dagrun_trace_carrier,
     new_task_run_carrier,
 )
+from airflow._shared.state import TaskFailureKind
 from airflow._shared.timezones import timezone
 from airflow.assets.manager import asset_manager
 from airflow.configuration import conf
@@ -555,6 +556,44 @@ def _date_or_empty(*, task_instance: TaskInstance, attr: str) -> str:
     """
     result: datetime | None = getattr(task_instance, attr, None)
     return result.strftime("%Y%m%dT%H%M%S") if result else ""
+
+
+def _maybe_refund_infra_attempt(*, task_instance, task, failure_kind) -> bool:
+    """
+    Refund one retry attempt (bump ``max_tries``) for an infra-classified failure.
+
+    Fires only when ``failure_kind == INFRA``, ``[core] infra_failure_refund_retries``
+    is on, and the ``[core] max_infra_refunds`` cap is not yet reached. Every other
+    kind — and an unclassified (``None``) failure — spends the user's retry. Returns
+    True if an attempt was refunded.
+
+    :meta private:
+    """
+    # retries may be None (unset); treat it as falsy like is_eligible_to_retry does.
+    # With no budget to protect the refund is a no-op, so skip it.
+    retries = getattr(task, "retries", None) or 0
+    if (
+        failure_kind != TaskFailureKind.INFRA
+        or task is None
+        or not retries
+        or not conf.getboolean("core", "infra_failure_refund_retries", fallback=False)
+    ):
+        return False
+    max_infra_refunds = conf.getint("core", "max_infra_refunds", fallback=3)
+    refunds_used = max((task_instance.max_tries or 0) - retries, 0)
+    if refunds_used >= max_infra_refunds:
+        return False
+    task_instance.max_tries += 1
+    log.info(
+        "infra failure (%s) refunded attempt for %s; max_tries now %s "
+        "(refund %s/%s), user retry budget preserved",
+        getattr(task_instance, "infra_reason", None),
+        task_instance,
+        task_instance.max_tries,
+        refunds_used + 1,
+        max_infra_refunds,
+    )
+    return True
 
 
 def uuid7() -> UUID:
@@ -1894,6 +1933,11 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
 
         # Actual callbacks are handled by the DAG processor, not the scheduler
         task = getattr(ti, "task", None)
+
+        # An infra-classified failure refunds the attempt instead of spending the
+        # user's retry budget (opt-in, capped). Extends the Kubernetes executor's
+        # pre-execution requeue-without-consuming-a-retry to the mid-execution case.
+        _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_kind=failure_kind)
 
         if not ti.is_eligible_to_retry():
             ti.state = TaskInstanceState.FAILED
