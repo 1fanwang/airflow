@@ -2579,6 +2579,7 @@ class TestTaskInstance:
             "executor": "some_executor",
             "executor_config": {"Some": {"extra": "information"}},
             "external_executor_id": "some_executor_id",
+            "infra_reason": "Evicted",
             "trigger_timeout": None,
             "trigger_id": None,
             "next_kwargs": None,

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from airflow.models.taskinstance import TaskInstance
     from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
     from airflow.utils.state import TaskInstanceState
+    from airflow_shared.state import TaskFailureKind
 
 hookspec = HookspecMarker("airflow")
 
@@ -52,8 +53,28 @@ def on_task_instance_failed(
     previous_state: TaskInstanceState | None,
     task_instance: RuntimeTaskInstance | TaskInstance,
     error: None | str | BaseException,
+    failure_kind: TaskFailureKind | None,
 ):
-    """Execute when task state changes to FAIL. previous_state can be None."""
+    """
+    Execute when task state changes to FAIL. previous_state can be None.
+
+    :param previous_state: Previous state of the task instance (can be None)
+    :param task_instance: The task instance object
+    :param error: The exception that caused the failure (or human-readable
+        message string for API-driven manual transitions)
+    :param failure_kind: What caused the failure — a :class:`TaskFailureKind`
+        (``INFRA`` / ``APPLICATION`` / ``TIMEOUT`` / ``MANUAL``), or ``None`` when
+        the cause was not classified. The executor's reason token (for ``INFRA``)
+        is on ``task_instance.infra_reason``.
+
+        Pluggy dispatches by parameter name, so a ``hookimpl`` that doesn't declare
+        ``failure_kind`` keeps working. One that does must declare it *without* a
+        default — pluggy treats an impl-side default as authoritative and overrides
+        the caller's value::
+
+            @hookimpl
+            def on_task_instance_failed(self, previous_state, task_instance, error, failure_kind): ...
+    """
 
 
 @hookspec

@@ -650,6 +650,9 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
     # Cleared on task start (ti_run).  Read by next_retry_datetime().
     retry_delay_override: Mapped[float | None] = mapped_column(Float, nullable=True)
     retry_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # The executor's reason token for an infra failure (e.g. Evicted); None otherwise.
+    # Persisted like retry_reason so listeners can read the cause off the TaskInstance.
+    infra_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     __table_args__ = (
         Index("ti_dag_state", dag_id, state),
@@ -1842,6 +1845,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         *,
         session: Session,
         fail_fast: bool = False,
+        failure_kind: str | None = None,
+        infra_reason: str | None = None,
     ):
         """
         Fetch the context needed to handle a failure.
@@ -1851,11 +1856,19 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         :param test_mode: doesn't record success or failure in the DB if True
         :param session: SQLAlchemy ORM Session
         :param fail_fast: if True, fail all downstream tasks
+        :param failure_kind: what caused the failure (:class:`TaskFailureKind` or
+            ``None``). ``INFRA`` refunds the attempt instead of charging the user's
+            retry budget, gated by config.
+        :param infra_reason: the executor's reason token for an infra failure, persisted on the row.
         """
         if error:
             cls.logger().error("%s", error)
         if not test_mode:
             ti.refresh_from_db(session=session)
+
+        # Set after refresh_from_db, which would otherwise reset it.
+        if infra_reason is not None:
+            ti.infra_reason = infra_reason
 
         ti.end_date = timezone.utcnow()
         ti.set_duration()
@@ -1898,7 +1911,10 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
 
         try:
             get_listener_manager().hook.on_task_instance_failed(
-                previous_state=TaskInstanceState.RUNNING, task_instance=ti, error=error
+                previous_state=TaskInstanceState.RUNNING,
+                task_instance=ti,
+                error=error,
+                failure_kind=failure_kind,
             )
         except Exception:
             log.exception("error calling listener")
@@ -1920,6 +1936,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         test_mode: bool | None = None,
         *,
         session: Session = NEW_SESSION,
+        failure_kind: str | None = None,
+        infra_reason: str | None = None,
     ) -> None:
         """
         Handle Failure for a task instance.
@@ -1927,6 +1945,10 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         :param error: if specified, log the specific exception if thrown
         :param test_mode: doesn't record success or failure in the DB if True
         :param session: SQLAlchemy ORM Session
+        :param failure_kind: what caused the failure (:class:`TaskFailureKind` or
+            ``None``), forwarded to the listener and the retry decision.
+        :param infra_reason: the executor's reason token for an infra failure,
+            persisted on the task instance row.
         """
         if TYPE_CHECKING:
             assert self.task
@@ -1943,6 +1965,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
             test_mode=test_mode,
             session=session,
             fail_fast=fail_fast,
+            failure_kind=failure_kind,
+            infra_reason=infra_reason,
         )
 
         _log_state(task_instance=self)
