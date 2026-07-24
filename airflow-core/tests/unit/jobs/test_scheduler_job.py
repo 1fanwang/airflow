@@ -9281,6 +9281,7 @@ class TestSchedulerJob:
         # Mock the executor to simulate a task failure
         mock_executor = MagicMock(spec=BaseExecutor)
         mock_executor.has_task = mock.MagicMock(return_value=False)
+        mock_executor.get_task_failure_info.return_value = None
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(scheduler_job, executors=[mock_executor])
 
