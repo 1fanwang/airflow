@@ -17,11 +17,11 @@
 """
 AIP-97 SIGTERM-source classification safety.
 
-A SIGTERM to a running task is ambiguous — a user mark-failed and an infra
-eviction both deliver one. The refund must never fire for a user-initiated
-stop. The single gate is ``failure_kind``: only ``INFRA`` refunds. These tests
-pin that the kind each termination source carries maps to the right refund
-decision, independent of the signal.
+A SIGTERM to a running task is ambiguous: a user mark-failed and an infra
+eviction both deliver one. The extra infra retry must never fire for a
+user-initiated stop. The single gate is ``failure_kind``: only ``INFRA`` is
+granted one. These tests pin that the kind each termination source carries
+maps to the right decision, independent of the signal.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from __future__ import annotations
 import pytest
 
 from airflow._shared.state import TaskFailureKind
-from airflow.models.taskinstance import _maybe_refund_infra_attempt
+from airflow.models.taskinstance import _maybe_grant_infra_retry
 
 from tests_common.test_utils.config import conf_vars
 
@@ -37,8 +37,8 @@ ENABLED = {("core", "infra_failure_refund_retries"): "True", ("core", "max_infra
 
 
 class _TI:
-    def __init__(self, max_tries=1):
-        self.max_tries = max_tries
+    def __init__(self):
+        self.infra_retry_count = 0
         self.infra_reason = None
 
     def __str__(self):
@@ -50,22 +50,22 @@ class _Task:
 
 
 @pytest.mark.parametrize(
-    ("source", "failure_kind", "should_refund"),
+    ("source", "failure_kind", "should_grant"),
     [
-        # non-infra causes — never refunded, whatever signal did the killing
+        # non-infra causes — never granted an infra retry, whatever signal did the killing
         ("mark_task_failed", TaskFailureKind.MANUAL, False),
         ("mark_dagrun_failed", TaskFailureKind.MANUAL, False),
         ("app_exception", TaskFailureKind.APPLICATION, False),
         ("own_limit_oom", TaskFailureKind.APPLICATION, False),
         ("execution_timeout", TaskFailureKind.TIMEOUT, False),
         ("unclassified", None, False),
-        # infrastructure disruption — the only refunded cause
+        # infrastructure disruption — the only granted cause
         ("pod_evicted", TaskFailureKind.INFRA, True),
     ],
 )
 @conf_vars(ENABLED)
-def test_only_infra_source_refunds(source, failure_kind, should_refund):
-    ti = _TI(max_tries=1)
-    refunded = _maybe_refund_infra_attempt(task_instance=ti, task=_Task(), failure_kind=failure_kind)
-    assert refunded is should_refund, source
-    assert ti.max_tries == (2 if should_refund else 1)
+def test_only_infra_source_grants_retry(source, failure_kind, should_grant):
+    ti = _TI()
+    granted = _maybe_grant_infra_retry(task_instance=ti, task=_Task(), failure_kind=failure_kind)
+    assert granted is should_grant, source
+    assert ti.infra_retry_count == (1 if should_grant else 0)

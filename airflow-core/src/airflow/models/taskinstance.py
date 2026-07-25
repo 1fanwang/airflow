@@ -558,40 +558,37 @@ def _date_or_empty(*, task_instance: TaskInstance, attr: str) -> str:
     return result.strftime("%Y%m%dT%H%M%S") if result else ""
 
 
-def _maybe_refund_infra_attempt(*, task_instance, task, failure_kind) -> bool:
+def _maybe_grant_infra_retry(*, task_instance, task, failure_kind) -> bool:
     """
-    Refund one retry attempt (bump ``max_tries``) for an infra-classified failure.
+    Grant one extra retry for an infra failure via the dedicated ``infra_retry_count`` counter.
 
-    Fires only when ``failure_kind == INFRA``, ``[core] infra_failure_refund_retries``
-    is on, and the ``[core] max_infra_refunds`` cap is not yet reached. Every other
-    kind — and an unclassified (``None``) failure — spends the user's retry. Returns
-    True if an attempt was refunded.
+    Leaves ``max_tries`` equal to the user's ``retries``. Fires only when ``failure_kind == INFRA``,
+    ``[core] infra_failure_refund_retries`` is on, and the ``[core] max_infra_refunds`` cap is not
+    yet reached. Unlike bumping ``max_tries``, the counter is not gated on the user having configured
+    ``retries``, so a task with ``retries=0`` still gets its infra attempts back. Returns True if a
+    retry was granted.
 
     :meta private:
     """
-    # retries may be None (unset); treat it as falsy like is_eligible_to_retry does.
-    # With no budget to protect the refund is a no-op, so skip it.
-    retries = getattr(task, "retries", None) or 0
     if (
         failure_kind != TaskFailureKind.INFRA
         or task is None
-        or not retries
         or not conf.getboolean("core", "infra_failure_refund_retries", fallback=False)
     ):
         return False
-    max_infra_refunds = conf.getint("core", "max_infra_refunds", fallback=3)
-    refunds_used = max((task_instance.max_tries or 0) - retries, 0)
-    if refunds_used >= max_infra_refunds:
+    cap = conf.getint("core", "max_infra_refunds", fallback=3)
+    granted = task_instance.infra_retry_count or 0
+    if granted >= cap:
         return False
-    task_instance.max_tries += 1
+    task_instance.infra_retry_count = granted + 1
     log.info(
-        "infra failure (%s) refunded attempt for %s; max_tries now %s "
-        "(refund %s/%s), user retry budget preserved",
+        "infra failure (%s) granted an extra retry for %s; infra_retry_count now %s "
+        "(%s/%s), user retry budget untouched",
         getattr(task_instance, "infra_reason", None),
         task_instance,
-        task_instance.max_tries,
-        refunds_used + 1,
-        max_infra_refunds,
+        task_instance.infra_retry_count,
+        task_instance.infra_retry_count,
+        cap,
     )
     return True
 
@@ -692,6 +689,10 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
     # The executor's reason token for an infra failure (e.g. Evicted); None otherwise.
     # Persisted like retry_reason so listeners can read the cause off the TaskInstance.
     infra_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Count of extra attempts granted for infra-classified failures. Extends the retry ceiling
+    # without inflating max_tries (which stays == the user's retries), so the user's retry number
+    # stays honest and, unlike max_tries, it can grant retries even when retries=0.
+    infra_retry_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
 
     __table_args__ = (
         Index("ti_dag_state", dag_id, state),
@@ -1934,10 +1935,10 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         # Actual callbacks are handled by the DAG processor, not the scheduler
         task = getattr(ti, "task", None)
 
-        # An infra-classified failure refunds the attempt instead of spending the
-        # user's retry budget (opt-in, capped). Extends the Kubernetes executor's
-        # pre-execution requeue-without-consuming-a-retry to the mid-execution case.
-        _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_kind=failure_kind)
+        # An infra-classified failure grants an extra attempt via the dedicated infra_retry_count
+        # counter instead of spending the user's retry budget (opt-in, capped). Because the counter
+        # is not gated on task.retries, it also protects a retries=0 task from an infra disruption.
+        _maybe_grant_infra_retry(task_instance=ti, task=task, failure_kind=failure_kind)
 
         if not ti.is_eligible_to_retry():
             ti.state = TaskInstanceState.FAILED
@@ -2030,9 +2031,14 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
 
         if TYPE_CHECKING:
             assert self.task
-            assert self.task.retries
 
-        return bool(self.task.retries and self.try_number <= self.max_tries)
+        normal = bool(self.task.retries and self.try_number <= self.max_tries)
+        # A dedicated infra counter extends the retry ceiling without inflating max_tries, and
+        # unlike max_tries it is not gated on the user having configured retries — so an infra
+        # disruption is retried even for a retries=0 task.
+        infra_granted = getattr(self, "infra_retry_count", 0) or 0
+        infra = infra_granted > 0 and self.try_number <= self.max_tries + infra_granted
+        return normal or infra
 
     def set_duration(self) -> None:
         """Set task instance duration."""
