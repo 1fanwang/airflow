@@ -119,11 +119,17 @@ wants the cause declares the argument:
     @hookimpl
     def on_task_instance_failed(self, previous_state, task_instance, error, failure_kind):
         if failure_kind == "infra":
-            # an infrastructure disruption, not the task's own code
-            alert(task_instance.infra_reason)
+            # an infrastructure disruption, not the task's own code: record it as
+            # capacity churn for tracking and dashboards, and don't page a human
+            emit_metric("task.infra_disruption", reason=task_instance.infra_reason)
+        else:
+            # the task's own code, a timeout, or a manual stop: a real failure
+            page_on_call(task_instance, error, failure_kind)
 
-A listener that does not declare the argument keeps working — the parameter is dispatched by name, so
-existing listeners need no migration.
+Teams that already build DAG and task lifecycle tracking on these listeners can use ``failure_kind``
+as the dimension that separates infrastructure churn from real bugs in their metrics, alerting, and
+lineage. A listener that does not declare the argument keeps working: the parameter is dispatched by
+name, so existing listeners need no migration.
 
 Asset Events
 --------------

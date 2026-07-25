@@ -358,6 +358,25 @@ core:
       type: integer
       default: "86400"
       example: ~
+    infra_failure_refund_retries:
+      description: |
+        When enabled, a task failure classified as infrastructure (``failure_kind=infra``) - an
+        evicted or preempted pod, a drained node, a lost Celery worker, a reclaimed spot instance -
+        refunds the retry it used instead of spending the user's ``retries`` budget. Capped by
+        ``max_infra_refunds``. Off by default, so behavior is unchanged until an operator opts in.
+      version_added: 3.4.0
+      type: boolean
+      example: ~
+      default: "False"
+    max_infra_refunds:
+      description: |
+        The most retry attempts a single task instance may have refunded for infrastructure
+        failures (see ``infra_failure_refund_retries``), so a task stuck on a bad node that keeps
+        getting evicted cannot refund itself indefinitely.
+      version_added: 3.4.0
+      type: integer
+      example: ~
+      default: "3"
     default_task_weight_rule:
       description: |
         The weighting method used for the effective total priority weight of the task
