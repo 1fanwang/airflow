@@ -52,6 +52,7 @@ from tests_common.test_utils.version_compat import (
     AIRFLOW_V_3_1_PLUS,
     AIRFLOW_V_3_2_PLUS,
     AIRFLOW_V_3_3_PLUS,
+    AIRFLOW_V_3_4_PLUS,
 )
 
 try:
@@ -1646,3 +1647,48 @@ class TestCreateCeleryAppTeamIsolation:
         team_conf = ExecutorConf(team_name="team_beta")
         celery_app = celery_executor_utils.create_celery_app(team_conf)
         assert "team_beta" in celery_app.main
+
+
+@pytest.mark.skipif(
+    not AIRFLOW_V_3_4_PLUS, reason="TaskFailureKind failure-context classification is Airflow 3.4+ only"
+)
+def test_worker_lost_classifies_infra():
+    """A Celery FAILURE carrying a WorkerLostError is classified infra; a normal task exception
+    (self-reported by the worker) is left unclassified. __init__ is bypassed so the check exercises
+    only update_task_state, with no broker or result backend required."""
+    from billiard.exceptions import WorkerLostError
+    from celery import states as _states
+
+    from airflow._shared.state import TaskFailureKind
+
+    executor = CeleryExecutor.__new__(CeleryExecutor)
+    executor.task_failure_info = {}
+    executor.fail = mock.MagicMock()
+
+    lost = TaskInstanceKey("d", "t", "r", 1)
+    app_bug = TaskInstanceKey("d", "t2", "r", 1)
+    executor.update_task_state(lost, _states.FAILURE, WorkerLostError("signal 9 (SIGKILL)"))
+    executor.update_task_state(app_bug, _states.FAILURE, ValueError("boom"))
+
+    assert executor.task_failure_info.get(lost) == (TaskFailureKind.INFRA, "WorkerLost")
+    assert app_bug not in executor.task_failure_info
+
+
+def test_bulk_fetcher_surfaces_exception_as_info():
+    """DB and KV result backends store the payload under 'result', not 'info', so a failed task's
+    exception never reached update_task_state before. The fetcher falls back to 'result' so a real
+    WorkerLostError is surfaced as info on every backend, where the classifier can see it."""
+    from billiard.exceptions import WorkerLostError
+    from celery import states as _states
+
+    from airflow.providers.celery.executors.celery_executor_utils import BulkStateFetcher
+
+    exc = WorkerLostError("Worker exited prematurely: signal 9 (SIGKILL) Job: 0.")
+    # Shape mirrors celery's DatabaseBackend meta_from_decoded output: no 'info' key.
+    meta = {"task_id": "abc", "status": _states.FAILURE, "result": exc, "traceback": "tb", "date_done": None}
+    out = BulkStateFetcher._prepare_state_and_info_by_task_dict({"abc"}, {"abc": meta})
+    state, info = out["abc"]
+
+    assert state == _states.FAILURE
+    assert info is exc
+    assert type(info).__name__ == "WorkerLostError"

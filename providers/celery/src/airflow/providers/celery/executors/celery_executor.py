@@ -34,6 +34,7 @@ from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import cpu_count
 from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias, cast
 
+from billiard.exceptions import WorkerLostError
 from celery import states as celery_states
 from deprecated import deprecated
 
@@ -42,12 +43,20 @@ from airflow.executors.base_executor import BaseExecutor
 from airflow.providers.celery.executors import (
     celery_executor_utils as _celery_executor_utils,  # noqa: F401 # Needed to register Celery tasks at worker startup, see #63043.
 )
-from airflow.providers.celery.version_compat import AIRFLOW_V_3_0_PLUS, AIRFLOW_V_3_2_PLUS
+from airflow.providers.celery.version_compat import (
+    AIRFLOW_V_3_0_PLUS,
+    AIRFLOW_V_3_2_PLUS,
+    AIRFLOW_V_3_4_PLUS,
+)
 from airflow.providers.common.compat.sdk import AirflowTaskTimeout, Stats
 from airflow.utils.helpers import prune_dict
 from airflow.utils.state import TaskInstanceState
 
 log = logging.getLogger(__name__)
+
+# Reason token for a task whose worker process was lost mid-run (OOM, node loss, SIGKILL);
+# Celery surfaces it as a billiard WorkerLostError. An infra disruption, not the task's own code.
+WORKER_LOST_REASON = "WorkerLost"
 
 
 CELERY_SEND_ERR_MSG_HEADER = "Error sending Celery workload"
@@ -294,6 +303,13 @@ class CeleryExecutor(BaseExecutor):
             if state == celery_states.SUCCESS:
                 self.success(key, info)
             elif state in (celery_states.FAILURE, celery_states.REVOKED):
+                # A worker killed mid-task (OOM, node loss, SIGKILL) surfaces as a WorkerLostError
+                # rather than the task's own exception. Classify it infra so it refunds like any
+                # other disruption; a normal task exception is self-reported and left unclassified.
+                if isinstance(info, WorkerLostError) and AIRFLOW_V_3_4_PLUS:
+                    from airflow._shared.state import TaskFailureKind
+
+                    self.task_failure_info[key] = (TaskFailureKind.INFRA, WORKER_LOST_REASON)
                 self.fail(key, info)
             elif state in (celery_states.STARTED, celery_states.PENDING, celery_states.RETRY):
                 pass
