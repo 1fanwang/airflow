@@ -155,6 +155,10 @@ DM = DagModel
 TASK_STUCK_IN_QUEUED_RESCHEDULE_EVENT = "stuck in queued reschedule"
 """:meta private:"""
 
+# infra_reason token for a task the scheduler fails because it stopped heartbeating: the worker
+# vanished (node loss, OOM, eviction, a lost connection) rather than reporting its own failure.
+HEARTBEAT_TIMEOUT_INFRA_REASON = "HeartbeatTimeout"
+
 # Per-tick cap on pending AssetPartitionDagRun rows the scheduler evaluates.
 # Bounds the per-tick transaction so executor heartbeats and regular scheduling
 # aren't starved; remaining APDRs drain across subsequent ticks.
@@ -3758,7 +3762,16 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     )
                 )
 
-            ti.handle_failure(error=msg, session=session)
+            # A missed heartbeat means the worker vanished (node loss, OOM, eviction, a lost
+            # connection) rather than the task reporting its own failure. Classify it infra so it
+            # refunds like any other disruption. This is executor-agnostic: it needs no pod, and
+            # fires for LocalExecutor, Celery, or Kubernetes alike.
+            ti.handle_failure(
+                error=msg,
+                session=session,
+                failure_kind=TaskFailureKind.INFRA,
+                infra_reason=HEARTBEAT_TIMEOUT_INFRA_REASON,
+            )
             executor = self._try_to_load_executor(
                 ti, session, team_name=dag_id_to_team_name.get(ti.dag_id, NOTSET)
             )

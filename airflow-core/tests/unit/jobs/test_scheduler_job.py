@@ -1337,6 +1337,48 @@ class TestSchedulerJob:
         assert len(consumed_event.source_aliases) == 1
         assert consumed_event.source_aliases[0].name == "test_alias"
 
+    def test_purge_without_heartbeat_classifies_infra(self, session, dag_maker, create_dagrun):
+        """A task failed for a missed heartbeat is classified infra (HeartbeatTimeout), so the
+        refund gate treats a vanished worker like any other infrastructure disruption."""
+        from airflow._shared.state import TaskFailureKind
+        from airflow.jobs.scheduler_job_runner import HEARTBEAT_TIMEOUT_INFRA_REASON
+
+        with dag_maker(dag_id="test_heartbeat_infra_kind"):
+            EmptyOperator(task_id="dummy_task")
+        scheduler_dag = sync_dag_to_db(dag_maker.dag)
+        dag_v = DagVersion.get_latest_version(dag_maker.dag.dag_id)
+        data_interval = infer_automated_data_interval(scheduler_dag.timetable, DEFAULT_LOGICAL_DATE)
+        dag_run = create_dagrun(
+            scheduler_dag,
+            logical_date=DEFAULT_DATE,
+            run_type=DagRunType.SCHEDULED,
+            data_interval=data_interval,
+        )
+
+        executor = MockExecutor()
+        scheduler_job = Job()
+        with mock.patch("airflow.executors.executor_loader.ExecutorLoader.load_executor") as loader_mock:
+            loader_mock.return_value = executor
+            self.job_runner = SchedulerJobRunner(job=scheduler_job)
+
+            ti = dag_run.get_task_instance("dummy_task")
+            ti.state = State.RUNNING
+            ti.last_heartbeat_at = timezone.utcnow() - timedelta(minutes=6)
+            ti.start_date = timezone.utcnow() - timedelta(minutes=10)
+            ti.queued_by_job_id = scheduler_job.id
+            ti.dag_version = dag_v
+            session.merge(ti)
+            session.flush()
+            executor.running.add(ti.key)
+
+            tis = self.job_runner._find_task_instances_without_heartbeats(session=session)
+            with mock.patch.object(TaskInstance, "handle_failure") as handle_failure:
+                self.job_runner._purge_task_instances_without_heartbeats(tis, session=session)
+
+        handle_failure.assert_called_once()
+        assert handle_failure.call_args.kwargs["failure_kind"] == TaskFailureKind.INFRA
+        assert handle_failure.call_args.kwargs["infra_reason"] == HEARTBEAT_TIMEOUT_INFRA_REASON
+
     # @pytest.mark.usefixtures("mock_executor")
     def test_execute_task_instances_backfill_tasks_will_execute(self, dag_maker):
         """
