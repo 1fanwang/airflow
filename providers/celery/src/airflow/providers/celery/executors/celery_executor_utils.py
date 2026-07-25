@@ -552,7 +552,12 @@ class BulkStateFetcher(LoggingMixin):
             task_result = task_results_by_task_id.get(task_id)
             if task_result:
                 state = task_result["status"]
+                # The DB and KV result backends store the payload under "result" (an exception for
+                # failed states); only the multiprocessing fetcher exposes it as "info". Fall back so
+                # a WorkerLostError reaches the executor's classifier the same way on every backend.
                 info = task_result.get("info")
+                if info is None:
+                    info = task_result.get("result")
             else:
                 state = celery_states.PENDING
                 info = None
