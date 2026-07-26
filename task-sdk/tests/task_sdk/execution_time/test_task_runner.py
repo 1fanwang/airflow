@@ -2161,6 +2161,31 @@ class TestRuntimeTaskInstance:
         # Now the lazy attribute should trigger the call
         mock_supervisor_comms.send.assert_called_once()
 
+    def test_get_template_context_exposes_failure_kind(self, create_runtime_ti):
+        """AIP-97: the failure cause the scheduler stamps on the callback's context_from_server
+        reaches a DAG-author on_failure/on_retry callback via ``context["failure_kind"]`` and
+        ``context["infra_reason"]``, so a callback can tell an infra disruption from a real bug."""
+        task = BaseOperator(task_id="t")
+        runtime_ti = create_runtime_ti(task=task, dag_id="test_failure_kind_context")
+        # the scheduler sets these on the callback request's context_from_server
+        runtime_ti._ti_context_from_server.failure_kind = "infra"
+        runtime_ti._ti_context_from_server.infra_reason = "Evicted"
+
+        context = runtime_ti.get_template_context()
+
+        assert context["failure_kind"] == "infra"
+        assert context["infra_reason"] == "Evicted"
+
+    def test_get_template_context_failure_kind_absent_is_none(self, create_runtime_ti):
+        """A normal task run carries no failure cause, so the keys default to None."""
+        task = BaseOperator(task_id="t")
+        runtime_ti = create_runtime_ti(task=task, dag_id="test_failure_kind_none")
+
+        context = runtime_ti.get_template_context()
+
+        assert context["failure_kind"] is None
+        assert context["infra_reason"] is None
+
     def test_get_connection_from_context(self, create_runtime_ti, mock_supervisor_comms):
         """Test that the connection is fetched from the API server via the Supervisor lazily when accessed"""
 

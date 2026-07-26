@@ -435,6 +435,12 @@ class TIRunContext(BaseModel):
     always reflects when the task *first* started, not when it was rescheduled/resumed.
     """
 
+    failure_kind: str | None = None
+    """The classified cause on a failure callback (infra/application/timeout/manual); None otherwise."""
+
+    infra_reason: str | None = None
+    """The executor's reason token for an infra failure (e.g. Evicted); set on a failure callback."""
+
 
 class PrevSuccessfulDagRunResponse(BaseModel):
     """Schema for response with previous successful DagRun information for Task Template Context."""

@@ -315,6 +315,8 @@ class RuntimeTaskInstance(TaskInstance):
                 "task": self.task,
                 "task_instance": self,
                 "ti": self,
+                "failure_kind": from_server.failure_kind if from_server else None,
+                "infra_reason": from_server.infra_reason if from_server else None,
                 "outlet_events": OutletEventAccessors(),
                 "inlet_events": InletEventsAccessors(self.task.inlets),
                 "macros": MacrosAccessor(),

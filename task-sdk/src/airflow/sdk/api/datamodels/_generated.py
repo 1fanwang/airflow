@@ -797,3 +797,5 @@ class TIRunContext(BaseModel):
     xcom_keys_to_clear: Annotated[list[str] | None, Field(title="Xcom Keys To Clear")] = None
     should_retry: Annotated[bool | None, Field(title="Should Retry")] = False
     start_date: Annotated[AwareDatetime | None, Field(title="Start Date")] = None
+    failure_kind: Annotated[str | None, Field(title="Failure Kind")] = None
+    infra_reason: Annotated[str | None, Field(title="Infra Reason")] = None
