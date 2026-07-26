@@ -5604,15 +5604,17 @@ class TestTaskInstanceMetrics:
             run(ti, context=ti.get_template_context(), log=mock.MagicMock())
 
             stats_tags = {"dag_id": ti.dag_id, "task_id": ti.task_id, "run_type": "manual"}
+            # AIP-97: a task raising is an application failure, so the metrics carry failure_kind
+            app_tags = {**stats_tags, "failure_kind": "application"}
 
             # verify operator_failures in legacy format
-            backend.incr.assert_any_call("operator_failures_PythonOperator", tags=stats_tags)
+            backend.incr.assert_any_call("operator_failures_PythonOperator", tags=app_tags)
             # verify operator_failures in tagged format
             backend.incr.assert_any_call(
                 "operator_failures",
-                tags={**stats_tags, "operator_name": "PythonOperator"},
+                tags={**app_tags, "operator_name": "PythonOperator"},
             )
-            backend.incr.assert_any_call("ti_failures", tags=stats_tags)
+            backend.incr.assert_any_call("ti_failures", tags=app_tags)
 
     @pytest.mark.parametrize(
         ("team_name", "expected_tags_extra"),
@@ -5667,11 +5669,13 @@ class TestTaskInstanceMetrics:
                 "run_type": "manual",
                 "team_name": "team_a",
             }
+            # AIP-97: failures carry the classified cause; a raise is an application failure
+            failure_extra = {"failure_kind": "application"} if ti_metric == "ti_failures" else {}
             backend.incr.assert_any_call(
                 operator_metric,
-                tags={**stats_tags, "operator_name": "PythonOperator"},
+                tags={**stats_tags, "operator_name": "PythonOperator", **failure_extra},
             )
-            backend.incr.assert_any_call(ti_metric, tags=stats_tags)
+            backend.incr.assert_any_call(ti_metric, tags={**stats_tags, **failure_extra})
 
 
 class TestDetailSpan:

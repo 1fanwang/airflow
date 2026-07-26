@@ -1816,6 +1816,11 @@ def _handle_current_task_failed(
     """
     from airflow.sdk.definitions.retry_policy import RetryAction
 
+    failure_kind = (
+        TaskFailureKind.TIMEOUT
+        if isinstance(exception, AirflowTaskTimeout)
+        else TaskFailureKind.APPLICATION
+    )
     decision = _evaluate_retry_policy(ti, exception, log, context)
     if decision is not None and decision.action == RetryAction.FAIL:
         ti.end_date = datetime.now(tz=timezone.utc)
@@ -1829,15 +1834,19 @@ def _handle_current_task_failed(
         )
     if decision is not None and decision.action == RetryAction.RETRY:
         return _finalize_task_failure(
-            ti, retry_delay_override=decision.retry_delay, retry_reason=decision.reason
+            ti,
+            retry_delay_override=decision.retry_delay,
+            retry_reason=decision.reason,
+            failure_kind=failure_kind,
         )
-    return _finalize_task_failure(ti)
+    return _finalize_task_failure(ti, failure_kind=failure_kind)
 
 
 def _finalize_task_failure(
     ti: RuntimeTaskInstance,
     retry_delay_override: timedelta | None = None,
     retry_reason: str | None = None,
+    failure_kind: TaskFailureKind | None = None,
 ) -> tuple[RetryTask, TaskInstanceState] | tuple[TaskState, TaskInstanceState]:
     """
     Record failure metrics and build the standard retry-or-fail outcome.
@@ -1854,8 +1863,15 @@ def _finalize_task_failure(
     operator = ti.task.__class__.__name__
     stats_tags = ti.stats_tags
 
-    stats.incr("operator_failures", tags={**stats_tags, "operator_name": operator})
-    stats.incr("ti_failures", tags=stats_tags)
+    # AIP-97: tag the worker-reported failure metrics with the classified cause, matching the
+    # scheduler-side emission so a dashboard can group every failure by failure_kind.
+    _failure_kind_tag = (
+        {"failure_kind": getattr(failure_kind, "value", failure_kind)} if failure_kind else {}
+    )
+    stats.incr(
+        "operator_failures", tags={**stats_tags, "operator_name": operator, **_failure_kind_tag}
+    )
+    stats.incr("ti_failures", tags={**stats_tags, **_failure_kind_tag})
 
     if ti._ti_context_from_server and ti._ti_context_from_server.should_retry:
         retry_kwargs: dict[str, Any] = {"end_date": end_date}
