@@ -16,6 +16,8 @@
 # under the License.
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from airflow.models.taskinstance import _maybe_refund_infra_attempt
@@ -90,3 +92,14 @@ class TestMaybeRefundInfraAttempt:
             False,
         ]
         assert ti.max_tries == 4  # 1 + three refunds, then capped
+
+    @conf_vars(ENABLED)
+    def test_cap_reached_is_logged(self, caplog):
+        # Once the cap is hit the refund declines, but says why, so an infra failure that
+        # spends a real retry is never silent in the logs even with the feature on.
+        ti, task = _FakeTI(max_tries=4), _FakeTask(retries=1)  # already at cap: 4 - 1 == 3
+        with caplog.at_level(logging.INFO, logger="airflow.models.taskinstance"):
+            assert _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_kind="infra") is False
+        assert "cap (3) reached" in caplog.text
+        assert "Evicted" in caplog.text
+        assert ti.max_tries == 4  # unchanged

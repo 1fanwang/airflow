@@ -1483,7 +1483,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 "run_start_date=%s, run_end_date=%s, "
                 "run_duration=%s, state=%s, executor=%s, executor_state=%s, try_number=%s, max_tries=%s, "
                 "pool=%s, queue=%s, priority_weight=%d, operator=%s, queued_dttm=%s, scheduled_dttm=%s,"
-                "queued_by_job_id=%s, pid=%s"
+                "queued_by_job_id=%s, pid=%s, failure_kind=%s, infra_reason=%s"
             )
             cls.logger().info(
                 msg,
@@ -1508,6 +1508,8 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 ti.scheduled_dttm,
                 ti.queued_by_job_id,
                 ti.pid,
+                executor_failure_kind[0].value if executor_failure_kind else None,
+                executor_failure_kind[1] if executor_failure_kind else None,
             )
 
             # There are multiple scenarios why the same TI with the same try_number looks queued or

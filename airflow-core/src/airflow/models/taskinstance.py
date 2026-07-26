@@ -582,6 +582,13 @@ def _maybe_refund_infra_attempt(*, task_instance, task, failure_kind) -> bool:
     max_infra_refunds = conf.getint("core", "max_infra_refunds", fallback=3)
     refunds_used = max((task_instance.max_tries or 0) - retries, 0)
     if refunds_used >= max_infra_refunds:
+        log.info(
+            "infra failure (%s) not refunded for %s: max_infra_refunds cap (%s) reached; "
+            "this attempt spends a real retry",
+            getattr(task_instance, "infra_reason", None),
+            task_instance,
+            max_infra_refunds,
+        )
         return False
     task_instance.max_tries += 1
     log.info(
