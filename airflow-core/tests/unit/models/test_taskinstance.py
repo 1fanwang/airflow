@@ -2449,6 +2449,38 @@ class TestTaskInstance:
             "operator_failures", tags={**expected_stats_tags, "operator_name": "EmptyOperator"}
         )
 
+    @patch("airflow._shared.observability.metrics.stats._get_backend")
+    def test_handle_failure_infra_kind_tags_metrics(self, mock_get_backend, dag_maker):
+        """AIP-97: an infra-classified failure tags ti_failures / operator_failures with
+        ``failure_kind`` so dashboards can separate infrastructure churn from real bugs."""
+        from airflow._shared.state import TaskFailureKind
+
+        mock_backend = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = mock_backend
+
+        session = settings.Session()
+        with dag_maker():
+            task = EmptyOperator(task_id="mytask", retries=1)
+        dr = dag_maker.create_dagrun()
+        ti = dr.get_task_instance(task.task_id, session=session)
+        ti.try_number += 1
+        ti = session.merge(ti)
+        ti.state = State.RUNNING
+        session.flush()
+        expected = {
+            "dag_id": ti.dag_id,
+            "task_id": ti.task_id,
+            "run_type": dr.run_type,
+            "failure_kind": "infra",
+        }
+
+        ti.handle_failure("infra kill", test_mode=False, failure_kind=TaskFailureKind.INFRA)
+
+        mock_backend.incr.assert_any_call("ti_failures", tags=expected)
+        mock_backend.incr.assert_any_call(
+            "operator_failures", tags={**expected, "operator_name": "EmptyOperator"}
+        )
+
     def test_handle_failure_task_undefined(self, create_task_instance):
         """
         When the loaded taskinstance does not use refresh_from_task, the task may be undefined.

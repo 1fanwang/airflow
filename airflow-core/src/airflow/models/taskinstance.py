@@ -1912,11 +1912,17 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         ti.end_date = timezone.utcnow()
         ti.set_duration()
 
+        # AIP-97: tag the failure metrics with the classified cause so dashboards can separate
+        # infrastructure churn from real bugs. Unset (None) for an unclassified failure, so the
+        # metric shape is unchanged where nothing classified it.
+        _failure_kind_tag = (
+            {"failure_kind": getattr(failure_kind, "value", failure_kind)} if failure_kind else {}
+        )
         stats.incr(
             "operator_failures",
-            tags={**ti.stats_tags, "operator_name": ti.operator},
+            tags={**ti.stats_tags, "operator_name": ti.operator, **_failure_kind_tag},
         )
-        stats.incr("ti_failures", tags=ti.stats_tags)
+        stats.incr("ti_failures", tags={**ti.stats_tags, **_failure_kind_tag})
 
         if not test_mode:
             session.add(Log(TaskInstanceState.FAILED.value, ti))
