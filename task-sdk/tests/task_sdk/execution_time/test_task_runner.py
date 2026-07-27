@@ -63,7 +63,7 @@ from airflow.sdk import (
     timezone,
 )
 from airflow.sdk._shared.observability.metrics.base_stats_logger import StatsLogger
-from airflow.sdk._shared.state import AssetScope, TaskScope
+from airflow.sdk._shared.state import AssetScope, TaskFailureKind, TaskScope
 from airflow.sdk.api.datamodels._generated import (
     AssetProfile,
     AssetResponse,
@@ -5605,7 +5605,7 @@ class TestTaskInstanceMetrics:
 
             stats_tags = {"dag_id": ti.dag_id, "task_id": ti.task_id, "run_type": "manual"}
             # AIP-97: a task raising is an application failure, so the metrics carry failure_kind
-            app_tags = {**stats_tags, "failure_kind": "application"}
+            app_tags = {**stats_tags, "failure_kind": TaskFailureKind.APPLICATION.value}
 
             # verify operator_failures in legacy format
             backend.incr.assert_any_call("operator_failures_PythonOperator", tags=app_tags)
@@ -5670,7 +5670,9 @@ class TestTaskInstanceMetrics:
                 "team_name": "team_a",
             }
             # AIP-97: failures carry the classified cause; a raise is an application failure
-            failure_extra = {"failure_kind": "application"} if ti_metric == "ti_failures" else {}
+            failure_extra = (
+                {"failure_kind": TaskFailureKind.APPLICATION.value} if ti_metric == "ti_failures" else {}
+            )
             backend.incr.assert_any_call(
                 operator_metric,
                 tags={**stats_tags, "operator_name": "PythonOperator", **failure_extra},

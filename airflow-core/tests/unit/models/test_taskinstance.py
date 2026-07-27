@@ -2471,7 +2471,7 @@ class TestTaskInstance:
             "dag_id": ti.dag_id,
             "task_id": ti.task_id,
             "run_type": dr.run_type,
-            "failure_kind": "infra",
+            "failure_kind": TaskFailureKind.INFRA.value,
         }
 
         ti.handle_failure("infra kill", test_mode=False, failure_kind=TaskFailureKind.INFRA)

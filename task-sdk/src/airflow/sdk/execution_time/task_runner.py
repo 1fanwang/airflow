@@ -1817,9 +1817,7 @@ def _handle_current_task_failed(
     from airflow.sdk.definitions.retry_policy import RetryAction
 
     failure_kind = (
-        TaskFailureKind.TIMEOUT
-        if isinstance(exception, AirflowTaskTimeout)
-        else TaskFailureKind.APPLICATION
+        TaskFailureKind.TIMEOUT if isinstance(exception, AirflowTaskTimeout) else TaskFailureKind.APPLICATION
     )
     decision = _evaluate_retry_policy(ti, exception, log, context)
     if decision is not None and decision.action == RetryAction.FAIL:
@@ -1865,12 +1863,8 @@ def _finalize_task_failure(
 
     # AIP-97: tag the worker-reported failure metrics with the classified cause, matching the
     # scheduler-side emission so a dashboard can group every failure by failure_kind.
-    _failure_kind_tag = (
-        {"failure_kind": getattr(failure_kind, "value", failure_kind)} if failure_kind else {}
-    )
-    stats.incr(
-        "operator_failures", tags={**stats_tags, "operator_name": operator, **_failure_kind_tag}
-    )
+    _failure_kind_tag = {"failure_kind": getattr(failure_kind, "value", failure_kind)} if failure_kind else {}
+    stats.incr("operator_failures", tags={**stats_tags, "operator_name": operator, **_failure_kind_tag})
     stats.incr("ti_failures", tags={**stats_tags, **_failure_kind_tag})
 
     if ti._ti_context_from_server and ti._ti_context_from_server.should_retry:
