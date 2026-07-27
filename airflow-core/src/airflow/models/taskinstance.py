@@ -1896,12 +1896,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
             retry budget, gated by config.
         :param reason: the executor's token for an infra failure (e.g. ``Evicted``).
             The worker never reported an error in that case, so it is surfaced as the
-            failure's ``error`` to the listener rather than persisted.
+            failure's ``reason`` argument to the listener rather than persisted.
         """
-        # For an infra failure the worker was killed before it could report anything,
-        # so the executor's token is the most specific thing we have; use it as the error.
-        if reason:
-            error = reason
         if error:
             cls.logger().error("%s", error)
         if not test_mode:
@@ -1957,6 +1953,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
                 task_instance=ti,
                 error=error,
                 failure_kind=failure_kind,
+                reason=reason,
             )
         except Exception:
             log.exception("error calling listener")

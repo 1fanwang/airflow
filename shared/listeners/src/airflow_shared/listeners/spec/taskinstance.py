@@ -54,6 +54,7 @@ def on_task_instance_failed(
     task_instance: RuntimeTaskInstance | TaskInstance,
     error: None | str | BaseException,
     failure_kind: TaskFailureKind | None,
+    reason: str | None,
 ):
     """
     Execute when task state changes to FAIL. previous_state can be None.
@@ -64,16 +65,19 @@ def on_task_instance_failed(
         message string for API-driven manual transitions)
     :param failure_kind: What caused the failure: a :class:`TaskFailureKind`
         (``INFRA`` / ``APPLICATION`` / ``TIMEOUT`` / ``MANUAL``), or ``None`` when
-        the cause was not classified. For ``INFRA`` the worker reported no error,
-        so the executor's token (e.g. ``Evicted``) is surfaced as ``error``.
+        the cause was not classified.
+    :param reason: For an ``INFRA`` failure, the executor's short token for what
+        happened (e.g. ``Evicted``, ``PodDeleted``), since the worker left no
+        ``error``. ``None`` otherwise. Transient — persist it yourself if you need
+        it to outlive the failure.
 
         Pluggy dispatches by parameter name, so a ``hookimpl`` that doesn't declare
-        ``failure_kind`` keeps working. One that does must declare it *without* a
-        default — pluggy treats an impl-side default as authoritative and overrides
-        the caller's value::
+        ``failure_kind`` / ``reason`` keeps working. One that does must declare it
+        *without* a default — pluggy treats an impl-side default as authoritative and
+        overrides the caller's value::
 
             @hookimpl
-            def on_task_instance_failed(self, previous_state, task_instance, error, failure_kind): ...
+            def on_task_instance_failed(self, previous_state, task_instance, error, failure_kind, reason): ...
     """
 
 
