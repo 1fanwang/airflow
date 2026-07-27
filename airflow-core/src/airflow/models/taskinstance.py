@@ -558,7 +558,7 @@ def _date_or_empty(*, task_instance: TaskInstance, attr: str) -> str:
     return result.strftime("%Y%m%dT%H%M%S") if result else ""
 
 
-def _maybe_refund_infra_attempt(*, task_instance, task, failure_kind) -> bool:
+def _maybe_refund_infra_attempt(*, task_instance, task, failure_kind, reason=None) -> bool:
     """
     Refund one retry attempt (bump ``max_tries``) for an infra-classified failure.
 
@@ -587,7 +587,7 @@ def _maybe_refund_infra_attempt(*, task_instance, task, failure_kind) -> bool:
     log.info(
         "infra failure (%s) refunded attempt for %s; max_tries now %s "
         "(refund %s/%s), user retry budget preserved",
-        getattr(task_instance, "infra_reason", None),
+        reason,
         task_instance,
         task_instance.max_tries,
         refunds_used + 1,
@@ -689,10 +689,6 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
     # Cleared on task start (ti_run).  Read by next_retry_datetime().
     retry_delay_override: Mapped[float | None] = mapped_column(Float, nullable=True)
     retry_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    # The executor's reason token for an infra failure (e.g. Evicted); None otherwise.
-    # Persisted like retry_reason so listeners can read the cause off the TaskInstance.
-    infra_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
-
     __table_args__ = (
         Index("ti_dag_state", dag_id, state),
         Index("ti_dag_run", dag_id, run_id),
@@ -1885,7 +1881,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         session: Session,
         fail_fast: bool = False,
         failure_kind: str | None = None,
-        infra_reason: str | None = None,
+        reason: str | None = None,
     ):
         """
         Fetch the context needed to handle a failure.
@@ -1898,16 +1894,18 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         :param failure_kind: what caused the failure (:class:`TaskFailureKind` or
             ``None``). ``INFRA`` refunds the attempt instead of charging the user's
             retry budget, gated by config.
-        :param infra_reason: the executor's reason token for an infra failure, persisted on the row.
+        :param reason: the executor's token for an infra failure (e.g. ``Evicted``).
+            The worker never reported an error in that case, so it is surfaced as the
+            failure's ``error`` to the listener rather than persisted.
         """
+        # For an infra failure the worker was killed before it could report anything,
+        # so the executor's token is the most specific thing we have; use it as the error.
+        if reason:
+            error = reason
         if error:
             cls.logger().error("%s", error)
         if not test_mode:
             ti.refresh_from_db(session=session)
-
-        # Set after refresh_from_db, which would otherwise reset it.
-        if infra_reason is not None:
-            ti.infra_reason = infra_reason
 
         ti.end_date = timezone.utcnow()
         ti.set_duration()
@@ -1937,7 +1935,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         # An infra-classified failure refunds the attempt instead of spending the
         # user's retry budget (opt-in, capped). Extends the Kubernetes executor's
         # pre-execution requeue-without-consuming-a-retry to the mid-execution case.
-        _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_kind=failure_kind)
+        _maybe_refund_infra_attempt(task_instance=ti, task=task, failure_kind=failure_kind, reason=reason)
 
         if not ti.is_eligible_to_retry():
             ti.state = TaskInstanceState.FAILED
@@ -1981,7 +1979,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         *,
         session: Session = NEW_SESSION,
         failure_kind: str | None = None,
-        infra_reason: str | None = None,
+        reason: str | None = None,
     ) -> None:
         """
         Handle Failure for a task instance.
@@ -1991,8 +1989,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         :param session: SQLAlchemy ORM Session
         :param failure_kind: what caused the failure (:class:`TaskFailureKind` or
             ``None``), forwarded to the listener and the retry decision.
-        :param infra_reason: the executor's reason token for an infra failure,
-            persisted on the task instance row.
+        :param reason: the executor's token for an infra failure, surfaced to the
+            listener as the failure's ``error`` (not persisted).
         """
         if TYPE_CHECKING:
             assert self.task
@@ -2010,7 +2008,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
             session=session,
             fail_fast=fail_fast,
             failure_kind=failure_kind,
-            infra_reason=infra_reason,
+            reason=reason,
         )
 
         _log_state(task_instance=self)

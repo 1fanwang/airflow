@@ -26,7 +26,6 @@ from tests_common.test_utils.config import conf_vars
 class _FakeTI:
     def __init__(self, max_tries: int):
         self.max_tries = max_tries
-        self.infra_reason = "Evicted"
 
     def __str__(self) -> str:
         return "<FakeTI>"

@@ -562,17 +562,14 @@ class TestSchedulerJob:
         # Unclassified (executor only reports a state) → no refund, exactly as today.
         ti = _run("aip97_unclassified", stashed=None)
         assert ti.max_tries == 1
-        assert ti.infra_reason is None
 
-        # Bridge classified it infra (e.g. a pod Evicted) → refunded, reason persisted.
+        # Bridge classified it infra (e.g. a pod Evicted) → refunded.
         ti = _run("aip97_infra", stashed=(TaskFailureKind.INFRA, "Evicted"))
         assert ti.max_tries == 2
-        assert ti.infra_reason == "Evicted"
 
         # Bridge classified it user (e.g. an app OOM against its own limit) → no refund.
         ti = _run("aip97_app_oom", stashed=(TaskFailureKind.APPLICATION, "OOMKilled"))
         assert ti.max_tries == 1
-        assert ti.infra_reason is None
 
     @mock.patch("airflow.jobs.scheduler_job_runner.TaskCallbackRequest", spec=TaskCallbackRequest)
     def test_process_executor_events_restarting_cleared_task(self, mock_task_callback, dag_maker):

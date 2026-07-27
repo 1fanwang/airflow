@@ -62,10 +62,10 @@ def on_task_instance_failed(
     :param task_instance: The task instance object
     :param error: The exception that caused the failure (or human-readable
         message string for API-driven manual transitions)
-    :param failure_kind: What caused the failure — a :class:`TaskFailureKind`
+    :param failure_kind: What caused the failure: a :class:`TaskFailureKind`
         (``INFRA`` / ``APPLICATION`` / ``TIMEOUT`` / ``MANUAL``), or ``None`` when
-        the cause was not classified. The executor's reason token (for ``INFRA``)
-        is on ``task_instance.infra_reason``.
+        the cause was not classified. For ``INFRA`` the worker reported no error,
+        so the executor's token (e.g. ``Evicted``) is surfaced as ``error``.
 
         Pluggy dispatches by parameter name, so a ``hookimpl`` that doesn't declare
         ``failure_kind`` keeps working. One that does must declare it *without* a

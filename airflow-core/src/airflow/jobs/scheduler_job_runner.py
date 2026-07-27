@@ -1673,14 +1673,14 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 # eviction from a silent crash, so it stays unclassified and spends the
                 # retry as today.
                 if executor_failure_kind is not None:
-                    failure_kind, infra_reason = executor_failure_kind
+                    failure_kind, reason = executor_failure_kind
                 else:
-                    failure_kind, infra_reason = None, None
+                    failure_kind, reason = None, None
                 ti.handle_failure(
                     error=msg,
                     session=session,
                     failure_kind=failure_kind,
-                    infra_reason=infra_reason if failure_kind == TaskFailureKind.INFRA else None,
+                    reason=reason if failure_kind == TaskFailureKind.INFRA else None,
                 )
 
         cls._emit_executor_events_batch_metrics(num_events)
