@@ -63,7 +63,7 @@ from airflow.sdk import (
     timezone,
 )
 from airflow.sdk._shared.observability.metrics.base_stats_logger import StatsLogger
-from airflow.sdk._shared.state import AssetScope, TaskScope
+from airflow.sdk._shared.state import AssetScope, TaskFailureKind, TaskScope
 from airflow.sdk.api.datamodels._generated import (
     AssetProfile,
     AssetResponse,
@@ -2168,13 +2168,14 @@ class TestRuntimeTaskInstance:
         task = BaseOperator(task_id="t")
         runtime_ti = create_runtime_ti(task=task, dag_id="test_failure_kind_context")
         # the scheduler sets these on the callback request's context_from_server
-        runtime_ti._ti_context_from_server.failure_kind = "infra"
-        runtime_ti._ti_context_from_server.infra_reason = "Evicted"
+        infra_reason = "Evicted"
+        runtime_ti._ti_context_from_server.failure_kind = TaskFailureKind.INFRA.value
+        runtime_ti._ti_context_from_server.infra_reason = infra_reason
 
         context = runtime_ti.get_template_context()
 
-        assert context["failure_kind"] == "infra"
-        assert context["infra_reason"] == "Evicted"
+        assert context["failure_kind"] == TaskFailureKind.INFRA.value
+        assert context["infra_reason"] == infra_reason
 
     def test_get_template_context_failure_kind_absent_is_none(self, create_runtime_ti):
         """A normal task run carries no failure cause, so the keys default to None."""

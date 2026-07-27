@@ -1615,9 +1615,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                             variables=[],
                             connections=[],
                             xcom_keys_to_clear=[],
-                            failure_kind=(
-                                executor_failure_kind[0].value if executor_failure_kind else None
-                            ),
+                            failure_kind=(executor_failure_kind[0].value if executor_failure_kind else None),
                             infra_reason=(executor_failure_kind[1] if executor_failure_kind else None),
                         ),
                     )
