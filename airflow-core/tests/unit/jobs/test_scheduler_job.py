@@ -3812,6 +3812,35 @@ class TestSchedulerJob:
         assert any("Backfilled dag_version_id" in rec.message for rec in caplog.records)
         mock_executor.send_callback.assert_called_once()
 
+    def test_purge_without_heartbeat_classifies_infra(self, dag_maker, session):
+        """A worker that stopped heartbeating is infra, with no executor able to name the cause."""
+        from airflow._shared.state import TaskFailureKind
+        from airflow.jobs.scheduler_job_runner import HEARTBEAT_TIMEOUT_REASON
+
+        with dag_maker("test_purge_without_heartbeat_classifies_infra", session=session):
+            EmptyOperator(task_id="task")
+
+        dag_run = dag_maker.create_dagrun(run_id="test_run", state=DagRunState.RUNNING)
+
+        mock_executor = MagicMock()
+        scheduler_job = Job()
+        self.job_runner = SchedulerJobRunner(scheduler_job, executors=[mock_executor])
+
+        ti = dag_run.get_task_instance(task_id="task", session=session)
+        ti.state = TaskInstanceState.RUNNING
+        ti.queued_by_job_id = scheduler_job.id
+        ti.last_heartbeat_at = timezone.utcnow() - timedelta(hours=1)
+        session.merge(ti)
+        session.commit()
+
+        with mock.patch.object(TaskInstance, "handle_failure", autospec=True) as handle_failure:
+            self.job_runner._purge_task_instances_without_heartbeats([ti], session=session)
+
+        handle_failure.assert_called_once()
+        kwargs = handle_failure.call_args.kwargs
+        assert kwargs["failure_kind"] == TaskFailureKind.INFRA
+        assert kwargs["reason"] == HEARTBEAT_TIMEOUT_REASON
+
     @pytest.mark.parametrize(
         ("multi_team", "expected_tags"),
         [

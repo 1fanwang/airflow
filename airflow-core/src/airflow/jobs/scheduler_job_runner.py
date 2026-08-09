@@ -156,6 +156,10 @@ DM = DagModel
 TASK_STUCK_IN_QUEUED_RESCHEDULE_EVENT = "stuck in queued reschedule"
 """:meta private:"""
 
+# The worker vanished rather than reporting its own failure, so no executor can name the cause.
+# Executor-agnostic: it needs no pod and no backend API, so it is the floor for every executor.
+HEARTBEAT_TIMEOUT_REASON = "HeartbeatTimeout"
+
 # Per-tick cap on pending AssetPartitionDagRun rows the scheduler evaluates.
 # Bounds the per-tick transaction so executor heartbeats and regular scheduling
 # aren't starved; remaining APDRs drain across subsequent ticks.
@@ -3756,7 +3760,12 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     )
                 )
 
-            ti.handle_failure(error=msg, session=session)
+            ti.handle_failure(
+                error=msg,
+                session=session,
+                failure_kind=TaskFailureKind.INFRA,
+                reason=HEARTBEAT_TIMEOUT_REASON,
+            )
             executor = self._try_to_load_executor(
                 ti, session, team_name=dag_id_to_team_name.get(ti.dag_id, NOTSET)
             )
