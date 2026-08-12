@@ -23,7 +23,11 @@ from typing import TYPE_CHECKING
 
 import attrs
 
+from sqlalchemy import select
+
+from airflow.models.task_state_store import TaskStateStoreModel
 from airflow.models.xcom import XComModel
+from airflow.sdk.bases.operatorlink import attempt_link_state_key
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.session import create_session
 
@@ -55,15 +59,27 @@ class XComOperatorLink(LoggingMixin):
             "Attempting to retrieve link from XComs with key: %s for task id: %s", self.xcom_key, ti_key
         )
         with create_session() as session:
+            # The state store survives the clear a retry issues, so it is the only place an
+            # earlier attempt's link still exists; XCom holds whichever attempt ran last.
             result = session.execute(
-                XComModel.get_many(
-                    key=self.xcom_key,
-                    run_id=ti_key.run_id,
-                    dag_ids=ti_key.dag_id,
-                    task_ids=ti_key.task_id,
-                    map_indexes=ti_key.map_index,
-                ).with_only_columns(XComModel.value)
+                select(TaskStateStoreModel.value).where(
+                    TaskStateStoreModel.dag_id == ti_key.dag_id,
+                    TaskStateStoreModel.run_id == ti_key.run_id,
+                    TaskStateStoreModel.task_id == ti_key.task_id,
+                    TaskStateStoreModel.map_index == ti_key.map_index,
+                    TaskStateStoreModel.key == attempt_link_state_key(self.xcom_key, ti_key.try_number),
+                )
             ).first()
+            if not result:
+                result = session.execute(
+                    XComModel.get_many(
+                        key=self.xcom_key,
+                        run_id=ti_key.run_id,
+                        dag_ids=ti_key.dag_id,
+                        task_ids=ti_key.task_id,
+                        map_indexes=ti_key.map_index,
+                    ).with_only_columns(XComModel.value)
+                ).first()
         if not result:
             self.log.debug(
                 "No link with name: %s present in XCom as key: %s, returning empty link",

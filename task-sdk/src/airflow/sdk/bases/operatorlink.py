@@ -27,6 +27,15 @@ if TYPE_CHECKING:
     from airflow.sdk.types import TaskInstanceKey
 
 
+ATTEMPT_LINK_STATE_KEY_PREFIX = "_link_attempt_"
+"""Prefix for the task-state-store keys holding one attempt's rendered operator link."""
+
+
+def attempt_link_state_key(xcom_key: str, try_number: int) -> str:
+    """Return the state-store key holding ``xcom_key``'s link as rendered for ``try_number``."""
+    return f"{ATTEMPT_LINK_STATE_KEY_PREFIX}{try_number}_{xcom_key}"
+
+
 @attrs.define()
 class BaseOperatorLink(metaclass=ABCMeta):
     """Abstract base class that defines how we get an operator link."""

@@ -58,6 +58,7 @@ from airflow.sdk.api.datamodels._generated import (
     TIRunContext,
 )
 from airflow.sdk.bases.operator import BaseOperator, ExecutorSafeguard
+from airflow.sdk.bases.operatorlink import attempt_link_state_key
 from airflow.sdk.bases.xcom import BaseXCom
 from airflow.sdk.configuration import conf
 from airflow.sdk.definitions._internal.dag_parsing_context import _airflow_parsing_context_manager
@@ -2329,6 +2330,10 @@ def finalize(
             link, xcom_key = oe.get_link(operator=task, ti_key=ti), oe.xcom_key  # type: ignore[arg-type]
             log.debug("Setting xcom for operator extra link", link=link, xcom_key=xcom_key)
             _xcom_push_to_db(ti, key=xcom_key, value=link)
+            # The task's XComs are cleared before the next attempt, so this attempt's link
+            # goes to the state store, which is not.
+            if (store := context.get("task_state_store")) is not None:
+                store.set(attempt_link_state_key(xcom_key, ti.try_number), link)
         except Exception:
             log.exception(
                 "Failed to push an xcom for task operator extra link",
