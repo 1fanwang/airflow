@@ -1649,46 +1649,77 @@ class TestCreateCeleryAppTeamIsolation:
         assert "team_beta" in celery_app.main
 
 
-@pytest.mark.skipif(
-    not AIRFLOW_V_3_4_PLUS, reason="TaskFailureKind failure-context classification is Airflow 3.4+ only"
-)
-def test_worker_lost_classifies_infra():
-    """A Celery FAILURE carrying a WorkerLostError is classified infra; a normal task exception
-    (self-reported by the worker) is left unclassified. __init__ is bypassed so the check exercises
-    only update_task_state, with no broker or result backend required."""
+@pytest.mark.skipif(not AIRFLOW_V_3_4_PLUS, reason="Executor failure reasons require Airflow 3.4+")
+def test_worker_lost_is_reason_only_for_task_instances():
     from billiard.exceptions import WorkerLostError
     from celery import states as _states
 
-    from airflow._shared.state import TaskFailureKind
+    from airflow.models.callback import CallbackKey
 
     executor = CeleryExecutor.__new__(CeleryExecutor)
-    executor.task_failure_info = {}
     executor.fail = mock.MagicMock()
 
     lost = TaskInstanceKey("d", "t", "r", 1)
     app_bug = TaskInstanceKey("d", "t2", "r", 1)
-    executor.update_task_state(lost, _states.FAILURE, WorkerLostError("signal 9 (SIGKILL)"))
-    executor.update_task_state(app_bug, _states.FAILURE, ValueError("boom"))
+    callback = CallbackKey("12345678-1234-5678-1234-567812345678")
+    lost_error = WorkerLostError("signal 9 (SIGKILL)")
+    app_error = ValueError("boom")
+    callback_error = WorkerLostError("callback worker lost")
 
-    assert executor.task_failure_info.get(lost) == (TaskFailureKind.INFRA, "WorkerLost")
-    assert app_bug not in executor.task_failure_info
+    executor.update_task_state(lost, _states.FAILURE, lost_error)
+    executor.update_task_state(app_bug, _states.FAILURE, app_error)
+    executor.update_task_state(callback, _states.FAILURE, callback_error)
+
+    assert executor.fail.call_args_list == [
+        mock.call(lost, lost_error, reason="WorkerLost"),
+        mock.call(app_bug, app_error),
+        mock.call(callback, callback_error),
+    ]
+
+
+def test_worker_lost_uses_legacy_fail_signature_before_airflow_3_4():
+    from billiard.exceptions import WorkerLostError
+    from celery import states as _states
+
+    executor = CeleryExecutor.__new__(CeleryExecutor)
+    executor.fail = mock.MagicMock()
+    key = TaskInstanceKey("d", "t", "r", 1)
+    error = WorkerLostError("signal 9 (SIGKILL)")
+
+    with mock.patch.object(celery_executor, "AIRFLOW_V_3_4_PLUS", False):
+        executor.update_task_state(key, _states.FAILURE, error)
+
+    executor.fail.assert_called_once_with(key, error)
 
 
 def test_bulk_fetcher_surfaces_exception_as_info():
-    """DB and KV result backends store the payload under 'result', not 'info', so a failed task's
-    exception never reached update_task_state before. The fetcher falls back to 'result' so a real
-    WorkerLostError is surfaced as info on every backend, where the classifier can see it."""
     from billiard.exceptions import WorkerLostError
     from celery import states as _states
 
     from airflow.providers.celery.executors.celery_executor_utils import BulkStateFetcher
 
     exc = WorkerLostError("Worker exited prematurely: signal 9 (SIGKILL) Job: 0.")
-    # Shape mirrors celery's DatabaseBackend meta_from_decoded output: no 'info' key.
-    meta = {"task_id": "abc", "status": _states.FAILURE, "result": exc, "traceback": "tb", "date_done": None}
-    out = BulkStateFetcher._prepare_state_and_info_by_task_dict({"abc"}, {"abc": meta})
-    state, info = out["abc"]
+    failure = {
+        "task_id": "failed",
+        "status": _states.FAILURE,
+        "result": exc,
+        "traceback": "tb",
+        "date_done": None,
+    }
+    success = {
+        "task_id": "succeeded",
+        "status": _states.SUCCESS,
+        "result": "return value",
+        "traceback": None,
+        "date_done": None,
+    }
+    out = BulkStateFetcher._prepare_state_and_info_by_task_dict(
+        {"failed", "succeeded"},
+        {"failed": failure, "succeeded": success},
+    )
+    state, info = out["failed"]
 
     assert state == _states.FAILURE
     assert info is exc
     assert type(info).__name__ == "WorkerLostError"
+    assert out["succeeded"] == (_states.SUCCESS, None)
