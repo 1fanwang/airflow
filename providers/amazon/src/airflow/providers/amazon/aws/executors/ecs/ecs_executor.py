@@ -23,7 +23,6 @@ Each Airflow task gets delegated out to an Amazon ECS Task.
 
 from __future__ import annotations
 
-import re
 import time
 import warnings
 from collections import defaultdict, deque
@@ -85,43 +84,19 @@ INVALID_CREDENTIALS_EXCEPTIONS = [
 # https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_Task.html
 # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/spot-interruption-errors.html
 STOP_CODE_SPOT_INTERRUPTION = "SpotInterruption"
-STOP_CODE_ESSENTIAL_CONTAINER_EXITED = "EssentialContainerExited"
-
-# A host that dies under a running task gets no stopCode of its own, so this has to match free
-# text. EcsRunTaskOperator._check_success_task already treats the same text as a distinct
-# non-application failure, citing the same AWS page.
-HOST_TERMINATED_REASON_PATTERN = re.compile(r"Host EC2 \(instance .+?\) (stopped|terminated)\.")
-ECS_HOST_TERMINATED_REASON = "HostTerminated"
 
 
-def classify_ecs_failure(
-    stop_code: str | None, stopped_reason: str | None
-) -> tuple[TaskFailureKind, str] | None:
-    """
-    Classify a stopped ECS task into a ``(TaskFailureKind, reason)`` pair.
-
-    Returns None when ECS gives nothing that separates a disruption from the task's own exit,
-    which leaves the failure unclassified and behaving as it does today.
-    """
+def classify_ecs_failure(stop_code: str | None) -> tuple[TaskFailureKind | None, str | None]:
+    """Map an ECS stop code to the shared failure contract."""
     if not AIRFLOW_V_3_4_PLUS:
-        return None
+        return None, None
 
     from airflow._shared.state import TaskFailureKind
 
     if stop_code == STOP_CODE_SPOT_INTERRUPTION:
         return TaskFailureKind.INFRA, STOP_CODE_SPOT_INTERRUPTION
 
-    if stopped_reason and HOST_TERMINATED_REASON_PATTERN.match(stopped_reason):
-        return TaskFailureKind.INFRA, ECS_HOST_TERMINATED_REASON
-
-    if stop_code == STOP_CODE_ESSENTIAL_CONTAINER_EXITED:
-        return TaskFailureKind.APPLICATION, STOP_CODE_ESSENTIAL_CONTAINER_EXITED
-
-    # Left unclassified on purpose: TaskFailedToStart spans a bad image (application) and lost
-    # capacity (infra); UserInitiated and ServiceSchedulerInitiated are neither. TerminationNotice
-    # and InfrastructureHealth both read as infra, but AWS documents neither and the stopped-task
-    # error-code page lists neither, so mapping them would be a guess.
-    return None
+    return None, stop_code
 
 
 class AwsEcsExecutor(BaseExecutor):
@@ -408,7 +383,12 @@ class AwsEcsExecutor(BaseExecutor):
                 "The ECS task failed due to the following containers failing:\n%s", "\n".join(reasons)
             )
 
-    def __handle_failed_workload(self, task_arn: str, reason: str, stop_code: str | None = None):
+    def __handle_failed_workload(
+        self,
+        task_arn: str,
+        reason: str | None,
+        stop_code: str | None = None,
+    ) -> None:
         """
         If an API failure occurs, the workload is rescheduled.
 
@@ -445,9 +425,14 @@ class AwsEcsExecutor(BaseExecutor):
         else:
             failure_kind: TaskFailureKind | None = None
             failure_reason: str | None = None
-            classified = classify_ecs_failure(stop_code, reason)
-            if classified is not None:
-                failure_kind, failure_reason = classified
+            is_task_instance = False
+            if AIRFLOW_V_3_4_PLUS:
+                # The provider still imports on Airflow versions without the cause contract.
+                from airflow.models.taskinstancekey import TaskInstanceKey
+
+                is_task_instance = isinstance(task_key, TaskInstanceKey)
+            if is_task_instance:
+                failure_kind, failure_reason = classify_ecs_failure(stop_code)
             self.log.error(
                 "Airflow workload %s has failed a maximum of %s times. Marking as failed. "
                 "stop_code=%s failure_kind=%s",
@@ -456,7 +441,10 @@ class AwsEcsExecutor(BaseExecutor):
                 stop_code,
                 failure_kind,
             )
-            self.fail(task_key, failure_kind=failure_kind, reason=failure_reason)
+            if is_task_instance:
+                self.fail(task_key, failure_kind=failure_kind, reason=failure_reason)
+            else:
+                self.fail(task_key)
         self.active_workers.pop_by_key(task_key)
 
     def attempt_workload_runs(self):

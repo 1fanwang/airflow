@@ -124,9 +124,9 @@ class EcsExecutorTask:
         containers: list[dict[str, Any]],
         started_at: Any | None = None,
         stopped_reason: str | None = None,
-        stop_code: str | None = None,
         external_executor_id: str | None = None,
-    ):
+        stop_code: str | None = None,
+    ) -> None:
         self.task_arn = task_arn
         self.last_status = last_status
         self.desired_status = desired_status
