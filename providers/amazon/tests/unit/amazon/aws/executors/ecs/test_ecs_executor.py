@@ -59,7 +59,12 @@ from airflow.version import version as airflow_version_str
 
 from tests_common import RUNNING_TESTS_AGAINST_AIRFLOW_PACKAGES
 from tests_common.test_utils.config import conf_vars
-from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS, AIRFLOW_V_3_1_PLUS, AIRFLOW_V_3_3_PLUS
+from tests_common.test_utils.version_compat import (
+    AIRFLOW_V_3_0_PLUS,
+    AIRFLOW_V_3_1_PLUS,
+    AIRFLOW_V_3_3_PLUS,
+    AIRFLOW_V_3_4_PLUS,
+)
 
 airflow_version = VersionInfo(*map(int, airflow_version_str.split(".")[:3]))
 
@@ -1217,14 +1222,16 @@ class TestAwsEcsExecutor:
                 }
             ],
         }
-        patcher = mock.patch(
+        with mock.patch(
             "airflow.providers.amazon.aws.executors.ecs.ecs_executor.AwsEcsExecutor.success", auth_spec=True
-        )
-        mock_success_function = patcher.start()
-        mock_executor.ecs.describe_tasks.return_value = {"tasks": [test_response_task_json], "failures": []}
-        mock_executor.sync_running_workloads()
-        assert len(mock_executor.active_workers) == 0
-        mock_success_function.assert_called_once()
+        ) as mock_success_function:
+            mock_executor.ecs.describe_tasks.return_value = {
+                "tasks": [test_response_task_json],
+                "failures": [],
+            }
+            mock_executor.sync_running_workloads()
+            assert len(mock_executor.active_workers) == 0
+            mock_success_function.assert_called_once()
 
     def test_update_running_tasks_failed(self, mock_executor, caplog):
         mock_executor.max_run_task_attempts = "1"
@@ -1246,14 +1253,16 @@ class TestAwsEcsExecutor:
             ],
         }
 
-        patcher = mock.patch(
+        with mock.patch(
             "airflow.providers.amazon.aws.executors.ecs.ecs_executor.AwsEcsExecutor.fail", auth_spec=True
-        )
-        mock_failed_function = patcher.start()
-        mock_executor.ecs.describe_tasks.return_value = {"tasks": [test_response_task_json], "failures": []}
-        mock_executor.sync_running_workloads()
-        assert len(mock_executor.active_workers) == 0
-        mock_failed_function.assert_called_once()
+        ) as mock_failed_function:
+            mock_executor.ecs.describe_tasks.return_value = {
+                "tasks": [test_response_task_json],
+                "failures": [],
+            }
+            mock_executor.sync_running_workloads()
+            assert len(mock_executor.active_workers) == 0
+            mock_failed_function.assert_called_once()
         assert (
             "The ECS task failed due to the following containers failing:\ntest-container-arn1 - "
             "test failure" in caplog.messages[0]
@@ -2127,3 +2136,208 @@ class TestEcsExecutorCallbackSupport:
         assert len(collection) == 2
         assert collection.key_to_arn[task_key] == ARN1
         assert collection.key_to_arn[callback_key] == ARN2
+
+
+@pytest.mark.skipif(
+    not AIRFLOW_V_3_4_PLUS, reason="TaskFailureKind failure-context classification is Airflow 3.4+ only"
+)
+class TestEcsFailureClassification:
+    @pytest.mark.parametrize(
+        ("stop_code", "expected"),
+        [
+            pytest.param("SpotInterruption", ("infra", "SpotInterruption")),
+            pytest.param("EssentialContainerExited", (None, "EssentialContainerExited")),
+            pytest.param("TaskFailedToStart", (None, "TaskFailedToStart")),
+            pytest.param(None, (None, None)),
+        ],
+    )
+    def test_classify_ecs_failure(self, stop_code, expected):
+        from airflow.providers.amazon.aws.executors.ecs.ecs_executor import classify_ecs_failure
+
+        kind, reason = classify_ecs_failure(stop_code)
+
+        assert (str(kind) if kind is not None else None, reason) == expected
+
+    def test_boto_schema_parses_stop_code(self):
+        task = BotoTaskSchema().load(
+            {
+                "taskArn": ARN1,
+                "desiredStatus": "STOPPED",
+                "lastStatus": "STOPPED",
+                "startedAt": dt.datetime.now(),
+                "stoppedReason": "Your Spot Task was interrupted.",
+                "stopCode": "SpotInterruption",
+                "containers": [
+                    {"containerArn": "c1", "name": "test_container", "lastStatus": "STOPPED", "exitCode": 137}
+                ],
+            }
+        )
+        assert task.stop_code == "SpotInterruption"
+        assert task.stopped_reason == "Your Spot Task was interrupted."
+
+    @staticmethod
+    def _add_mock_task(
+        executor: AwsEcsExecutor,
+        arn: str,
+        state: TaskInstanceState = TaskInstanceState.RUNNING,
+        task_key: TaskInstanceKey | None = None,
+    ) -> None:
+        task = mock_task(arn, state)
+        executor.active_workers.add_task(
+            task,
+            task_key if task_key is not None else mock.Mock(spec=TaskInstanceKey),
+            mock_queue,  # type:ignore[arg-type]
+            mock_cmd,  # type:ignore[arg-type]
+            mock_config,  # type:ignore[arg-type]
+            1,
+        )
+
+    def _stopped_task_json(self, stop_code, stopped_reason):
+        return {
+            "taskArn": ARN1,
+            "desiredStatus": "STOPPED",
+            "lastStatus": "STOPPED",
+            "startedAt": dt.datetime.now(),
+            "stoppedReason": stopped_reason,
+            "stopCode": stop_code,
+            "containers": [
+                {
+                    "containerArn": "test-container-arn1",
+                    "name": "test_container",
+                    "lastStatus": "STOPPED",
+                    "exitCode": 137,
+                    "reason": stopped_reason,
+                }
+            ],
+        }
+
+    def test_spot_interruption_reaches_the_scheduler_as_infra(self, mock_executor):
+        from airflow._shared.state import TaskFailureKind
+
+        mock_executor.max_run_task_attempts = "1"
+        self._add_mock_task(mock_executor, ARN1)
+        task_key = mock_executor.active_workers.arn_to_key[ARN1]
+        mock_executor.ecs.describe_tasks.return_value = {
+            "tasks": [self._stopped_task_json("SpotInterruption", "Your Spot Task was interrupted.")],
+            "failures": [],
+        }
+
+        mock_executor.sync_running_workloads()
+
+        assert mock_executor.get_task_failure_info(task_key) == (
+            TaskFailureKind.INFRA,
+            "SpotInterruption",
+        )
+        assert mock_executor.get_task_failure_info(task_key) is None
+
+    @pytest.mark.parametrize("stop_code", ["EssentialContainerExited", "TaskFailedToStart"])
+    def test_other_stop_codes_are_reason_only(self, mock_executor, stop_code):
+        mock_executor.max_run_task_attempts = "1"
+        self._add_mock_task(mock_executor, ARN1)
+        task_key = mock_executor.active_workers.arn_to_key[ARN1]
+        mock_executor.ecs.describe_tasks.return_value = {
+            "tasks": [self._stopped_task_json(stop_code, "ECS task stopped")],
+            "failures": [],
+        }
+
+        mock_executor.sync_running_workloads()
+
+        assert mock_executor.get_task_failure_info(task_key) == (None, stop_code)
+
+    def test_reschedule_does_not_classify(self, mock_executor):
+        mock_executor.max_run_task_attempts = "3"
+        self._add_mock_task(mock_executor, ARN1)
+        task_key = mock_executor.active_workers.arn_to_key[ARN1]
+        mock_executor.ecs.describe_tasks.return_value = {
+            "tasks": [self._stopped_task_json("SpotInterruption", "Your Spot Task was interrupted.")],
+            "failures": [],
+        }
+
+        mock_executor.sync_running_workloads()
+
+        assert mock_executor.get_task_failure_info(task_key) is None
+        assert len(mock_executor.pending_workloads) == 1
+
+    def test_old_airflow_uses_legacy_fail_signature(self, mock_executor):
+        mock_executor.max_run_task_attempts = "1"
+        self._add_mock_task(mock_executor, ARN1)
+        task_key = mock_executor.active_workers.arn_to_key[ARN1]
+        mock_executor.ecs.describe_tasks.return_value = {
+            "tasks": [self._stopped_task_json("SpotInterruption", "Your Spot Task was interrupted.")],
+            "failures": [],
+        }
+
+        with (
+            mock.patch.object(ecs_executor, "AIRFLOW_V_3_4_PLUS", False),
+            mock.patch.object(mock_executor, "fail") as fail,
+        ):
+            mock_executor.sync_running_workloads()
+
+        fail.assert_called_once_with(task_key)
+
+    def test_callback_failure_does_not_store_task_failure_info(self, mock_executor):
+        from airflow.models.callback import CallbackKey
+
+        callback_key = CallbackKey("12345678-1234-5678-1234-567812345678")
+        mock_executor.max_run_task_attempts = "1"
+        mock_executor.active_workers.add_task(
+            mock_task(ARN1),
+            callback_key,
+            None,
+            mock_cmd,  # type:ignore[arg-type]
+            mock_config,  # type:ignore[arg-type]
+            1,
+        )
+        mock_executor.ecs.describe_tasks.return_value = {
+            "tasks": [self._stopped_task_json("SpotInterruption", "Your Spot Task was interrupted.")],
+            "failures": [],
+        }
+
+        mock_executor.sync_running_workloads()
+
+        assert mock_executor.get_task_failure_info(callback_key) is None
+
+    @pytest.mark.db_test
+    def test_spot_interruption_uses_infra_budget(self, mock_executor, dag_maker, session):
+        from airflow._shared.state import INFRA_RETRIES_USED_STATE_KEY, TaskScope
+        from airflow.jobs.job import Job
+        from airflow.jobs.scheduler_job_runner import SchedulerJobRunner
+        from airflow.models.dagrun import DagRunState
+        from airflow.providers.standard.operators.empty import EmptyOperator
+        from airflow.state.metastore import _get_db_backend
+
+        with dag_maker(dag_id="ecs_spot_interruption", fileloc="/ecs/"):
+            task = EmptyOperator(task_id="task", retries=0, infra_retries=1)
+        ti = dag_maker.create_dagrun(state=DagRunState.RUNNING).get_task_instance(
+            task.task_id,
+            session=session,
+        )
+        ti.state = State.QUEUED
+        ti.queued_by_job_id = 1
+        session.flush()
+
+        mock_executor.max_run_task_attempts = "1"
+        self._add_mock_task(mock_executor, ARN1, task_key=ti.key)
+        mock_executor.ecs.describe_tasks.return_value = {
+            "tasks": [self._stopped_task_json("SpotInterruption", "Your Spot Task was interrupted.")],
+            "failures": [],
+        }
+
+        mock_executor.sync_running_workloads()
+        runner = SchedulerJobRunner(job=Job(), executors=[mock_executor])
+        SchedulerJobRunner.process_executor_events(
+            executor=mock_executor,
+            job_id=1,
+            scheduler_dag_bag=runner.scheduler_dag_bag,
+            session=session,
+        )
+        ti.refresh_from_db(session=session)
+
+        scope = TaskScope(
+            dag_id=ti.dag_id,
+            run_id=ti.run_id,
+            task_id=ti.task_id,
+            map_index=ti.map_index,
+        )
+        assert (ti.state, ti.max_tries) == (TaskInstanceState.UP_FOR_RETRY, 1)
+        assert _get_db_backend().get(scope, INFRA_RETRIES_USED_STATE_KEY, session=session) == "1"
