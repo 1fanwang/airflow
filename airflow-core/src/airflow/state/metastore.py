@@ -27,7 +27,6 @@ import structlog
 from sqlalchemy import delete, select
 
 from airflow._shared.state import (
-    INFRA_RETRIES_USED_STATE_KEY,
     AssetScope,
     AssetStateStoreWriterKind,
     BaseStoreBackend,
@@ -296,20 +295,6 @@ class MetastoreBackend(BaseStoreBackend):
             TaskStateStoreModel.dag_id == scope.dag_id,
             TaskStateStoreModel.run_id == scope.run_id,
             TaskStateStoreModel.task_id == scope.task_id,
-        ]
-        if not all_map_indices:
-            conditions.append(TaskStateStoreModel.map_index == scope.map_index)
-        session.execute(delete(TaskStateStoreModel).where(*conditions))
-
-    def clear_user_task_state(
-        self, scope: TaskScope, *, all_map_indices: bool = False, session: Session
-    ) -> None:
-        """Clear task-owned state while preserving Airflow's scheduler-owned keys."""
-        conditions = [
-            TaskStateStoreModel.dag_id == scope.dag_id,
-            TaskStateStoreModel.run_id == scope.run_id,
-            TaskStateStoreModel.task_id == scope.task_id,
-            TaskStateStoreModel.key != INFRA_RETRIES_USED_STATE_KEY,
         ]
         if not all_map_indices:
             conditions.append(TaskStateStoreModel.map_index == scope.map_index)

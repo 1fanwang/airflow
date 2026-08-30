@@ -9389,25 +9389,24 @@ class TestSchedulerJob:
         assert dispatched_callback == expected_dispatched_callback
 
     @pytest.mark.parametrize(
-        ("retries", "infra_retries", "failure_info", "callback_kind", "expected"),
+        ("retries", "failure_info", "callback_kind", "expected"),
         [
-            (1, 0, None, "retry", TaskInstanceState.UP_FOR_RETRY),
-            (0, 0, None, "failure", TaskInstanceState.FAILED),
+            (1, None, "retry", TaskInstanceState.UP_FOR_RETRY),
+            (0, None, "failure", TaskInstanceState.FAILED),
             (
                 0,
-                1,
                 (TaskFailureKind.INFRA, "Evicted"),
                 "retry",
                 TaskInstanceState.UP_FOR_RETRY,
             ),
         ],
     )
+    @conf_vars({("core", "max_infra_retries"): "1"})
     def test_external_kill_sets_callback_type_param(
         self,
         dag_maker,
         session,
         retries,
-        infra_retries,
         failure_info,
         callback_kind,
         expected,
@@ -9418,14 +9417,12 @@ class TestSchedulerJob:
                 EmptyOperator(
                     task_id="t1",
                     retries=retries,
-                    infra_retries=infra_retries,
                     on_retry_callback=lambda ctx: None,
                 )
             else:
                 EmptyOperator(
                     task_id="t1",
                     retries=retries,
-                    infra_retries=infra_retries,
                     on_failure_callback=lambda ctx: None,
                 )
         dr = dag_maker.create_dagrun(state=DagRunState.RUNNING)

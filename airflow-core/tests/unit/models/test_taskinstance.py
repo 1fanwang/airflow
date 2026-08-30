@@ -2456,7 +2456,7 @@ class TestTaskInstance:
         mock_get_backend.return_value = backend
         session = settings.Session()
         with dag_maker():
-            task = EmptyOperator(task_id="mytask", retries=0, infra_retries=1)
+            task = EmptyOperator(task_id="mytask", retries=0)
         dr = dag_maker.create_dagrun()
         ti = dr.get_task_instance(task.task_id, session=session)
         ti.task = task
