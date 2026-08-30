@@ -75,7 +75,7 @@ from airflow._shared.observability.traces import (
     new_dagrun_trace_carrier,
     new_task_run_carrier,
 )
-from airflow._shared.state import INFRA_RETRIES_USED_STATE_KEY, TaskFailureKind, TaskScope
+from airflow._shared.state import TaskFailureKind
 from airflow._shared.timezones import timezone
 from airflow.assets.manager import asset_manager
 from airflow.configuration import conf
@@ -601,48 +601,27 @@ def _maybe_use_infra_retry(
     task: Operator | None,
     failure_kind: TaskFailureKind | None,
     reason: str | None = None,
-    session: Session,
 ) -> bool:
-    """Use one retry from the task's infrastructure budget."""
+    """Grant one infrastructure retry without adding durable state."""
     if failure_kind != TaskFailureKind.INFRA or task is None:
         return False
 
-    infra_retries = getattr(task, "infra_retries", 0) or 0
+    infra_retries = conf.getint("core", "max_infra_retries", fallback=0)
     if infra_retries <= 0:
         return False
 
-    # airflow.state.metastore imports TaskInstance through DagRun.
-    from airflow.state.metastore import _get_db_backend
-
-    scope = TaskScope(
-        dag_id=task_instance.dag_id,
-        run_id=task_instance.run_id,
-        task_id=task_instance.task_id,
-        map_index=task_instance.map_index,
+    retries = getattr(task, "retries", None) or 0
+    infra_retries_used = max(
+        (task_instance.max_tries or 0) - retries,
+        task_instance.try_number - 1,
+        0,
     )
-    backend = _get_db_backend()
-    stored_count = backend.get(scope, INFRA_RETRIES_USED_STATE_KEY, session=session)
-    try:
-        infra_retries_used = int(stored_count) if stored_count is not None else 0
-    except ValueError:
-        log.error(
-            "Invalid infrastructure retry count for %s: %r",
-            task_instance,
-            stored_count,
-        )
-        return False
     if infra_retries_used >= infra_retries:
         return False
 
-    backend.set(
-        scope,
-        INFRA_RETRIES_USED_STATE_KEY,
-        str(infra_retries_used + 1),
-        session=session,
-    )
-    task_instance.max_tries += 1
+    task_instance.max_tries = (task_instance.max_tries or 0) + 1
     log.info(
-        "Using infrastructure retry %s/%s for %s; reason=%s, max_tries=%s",
+        "Using infrastructure retry at inferred position %s/%s for %s; reason=%s, max_tries=%s",
         infra_retries_used + 1,
         infra_retries,
         task_instance,
@@ -1996,7 +1975,6 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
             task=task,
             failure_kind=failure_kind,
             reason=reason,
-            session=session,
         )
 
         if not ti.is_eligible_to_retry():

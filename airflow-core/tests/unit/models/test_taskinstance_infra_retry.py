@@ -20,22 +20,24 @@ from types import SimpleNamespace
 
 import pytest
 
-from airflow._shared.state import INFRA_RETRIES_USED_STATE_KEY, TaskFailureKind, TaskScope
+from airflow._shared.state import TaskFailureKind
 from airflow.models.taskinstance import TaskInstance, _maybe_use_infra_retry, clear_task_instances
 from airflow.providers.standard.operators.empty import EmptyOperator
-from airflow.state.metastore import _get_db_backend
 from airflow.utils.state import TaskInstanceState
+
+from tests_common.test_utils.config import conf_vars
 
 pytestmark = pytest.mark.db_test
 
+INFRA_RETRIES = {("core", "max_infra_retries"): "3"}
 
-def _use_infra_retry(*, ti, task, failure_kind, session) -> bool:
+
+def _use_infra_retry(*, ti, task, failure_kind) -> bool:
     return _maybe_use_infra_retry(
         task_instance=ti,
         task=task,
         failure_kind=failure_kind,
         reason="Evicted",
-        session=session,
     )
 
 
@@ -44,26 +46,24 @@ class TestMaybeUseInfraRetry:
         "failure_kind",
         [None, TaskFailureKind.APPLICATION, TaskFailureKind.MANUAL, TaskFailureKind.TIMEOUT],
     )
-    def test_only_infra_uses_budget(self, failure_kind, dag_maker, session):
+    @conf_vars(INFRA_RETRIES)
+    def test_only_infra_uses_extra_attempts(self, failure_kind, dag_maker, session):
         with dag_maker(dag_id=f"failure_kind_{failure_kind or 'none'}"):
-            task = EmptyOperator(task_id="task", retries=0, infra_retries=1)
+            task = EmptyOperator(task_id="task", retries=0)
         ti = dag_maker.create_dagrun().get_task_instance(task.task_id, session=session)
         ti.task = task
 
-        assert (
-            _use_infra_retry(
-                ti=ti,
-                task=task,
-                failure_kind=failure_kind,
-                session=session,
-            )
-            is False
+        assert not _use_infra_retry(
+            ti=ti,
+            task=task,
+            failure_kind=failure_kind,
         )
         assert ti.max_tries == 0
 
-    def test_infra_budget_is_counted_in_task_state(self, dag_maker, session):
+    @conf_vars(INFRA_RETRIES)
+    def test_infra_attempts_are_inferred_from_max_tries(self, dag_maker, session):
         with dag_maker(dag_id="infra_budget"):
-            task = EmptyOperator(task_id="task", retries=0, infra_retries=2)
+            task = EmptyOperator(task_id="task", retries=0)
         ti = dag_maker.create_dagrun().get_task_instance(task.task_id, session=session)
         ti.task = task
 
@@ -72,40 +72,67 @@ class TestMaybeUseInfraRetry:
                 ti=ti,
                 task=task,
                 failure_kind=TaskFailureKind.INFRA,
-                session=session,
             )
-            for _ in range(3)
-        ] == [True, True, False]
-        assert ti.max_tries == 2
-
-        scope = TaskScope(
-            dag_id=ti.dag_id,
-            run_id=ti.run_id,
-            task_id=ti.task_id,
-            map_index=ti.map_index,
-        )
-        assert _get_db_backend().get(scope, INFRA_RETRIES_USED_STATE_KEY, session=session) == "2"
+            for _ in range(5)
+        ] == [True, True, True, False, False]
+        assert ti.max_tries == 3
 
     def test_zero_budget_preserves_current_behavior(self, dag_maker, session):
         with dag_maker(dag_id="zero_infra_budget"):
-            task = EmptyOperator(task_id="task", retries=1, infra_retries=0)
+            task = EmptyOperator(task_id="task", retries=1)
         ti = dag_maker.create_dagrun().get_task_instance(task.task_id, session=session)
         ti.task = task
 
-        assert (
-            _use_infra_retry(
-                ti=ti,
-                task=task,
-                failure_kind=TaskFailureKind.INFRA,
-                session=session,
-            )
-            is False
+        assert not _use_infra_retry(
+            ti=ti,
+            task=task,
+            failure_kind=TaskFailureKind.INFRA,
         )
         assert ti.max_tries == 1
 
-    def test_budget_survives_task_clear(self, dag_maker, session):
+    @conf_vars({("core", "max_infra_retries"): "1"})
+    def test_none_max_tries_uses_zero(self, dag_maker, session):
+        with dag_maker(dag_id="none_max_tries"):
+            task = EmptyOperator(task_id="task", retries=0)
+        ti = dag_maker.create_dagrun().get_task_instance(task.task_id, session=session)
+        ti.task = task
+        ti.max_tries = None
+
+        assert _use_infra_retry(
+            ti=ti,
+            task=task,
+            failure_kind=TaskFailureKind.INFRA,
+        )
+        assert ti.max_tries == 1
+
+    @conf_vars({("core", "max_infra_retries"): "1"})
+    def test_retry_increase_cannot_reopen_budget(self, dag_maker, session):
+        with dag_maker(dag_id="retries_changed"):
+            task = EmptyOperator(task_id="task", retries=0)
+        ti = dag_maker.create_dagrun().get_task_instance(task.task_id, session=session)
+        ti.task = task
+        ti.try_number = 1
+
+        assert _use_infra_retry(
+            ti=ti,
+            task=task,
+            failure_kind=TaskFailureKind.INFRA,
+        )
+
+        task.retries = 2
+        ti.try_number = 2
+
+        assert not _use_infra_retry(
+            ti=ti,
+            task=task,
+            failure_kind=TaskFailureKind.INFRA,
+        )
+        assert ti.max_tries == 1
+
+    @conf_vars(INFRA_RETRIES)
+    def test_task_clear_can_exhaust_inferred_budget(self, dag_maker, session):
         with dag_maker(dag_id="infra_budget_clear"):
-            task = EmptyOperator(task_id="task", retries=1, infra_retries=3)
+            task = EmptyOperator(task_id="task", retries=2)
         ti = dag_maker.create_dagrun().get_task_instance(task.task_id, session=session)
         ti.task = task
 
@@ -114,7 +141,6 @@ class TestMaybeUseInfraRetry:
                 ti=ti,
                 task=task,
                 failure_kind=TaskFailureKind.INFRA,
-                session=session,
             )
         ti.state = TaskInstanceState.FAILED
         ti.try_number = 3
@@ -123,17 +149,11 @@ class TestMaybeUseInfraRetry:
         clear_task_instances([ti], session=session)
         ti.task = task
 
-        assert _use_infra_retry(
-            ti=ti,
-            task=task,
-            failure_kind=TaskFailureKind.INFRA,
-            session=session,
-        )
+        assert ti.max_tries == 5
         assert not _use_infra_retry(
             ti=ti,
             task=task,
             failure_kind=TaskFailureKind.INFRA,
-            session=session,
         )
 
 

@@ -71,8 +71,6 @@ class AssetScope:
 
 StoreScope = TaskScope | AssetScope
 
-INFRA_RETRIES_USED_STATE_KEY = "__airflow_infra_retries_used"
-
 
 class TaskFailureKind(str, Enum):
     """Cause of a task failure, when Airflow can establish it."""

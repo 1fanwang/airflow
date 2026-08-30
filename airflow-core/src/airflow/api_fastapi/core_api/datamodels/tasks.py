@@ -64,7 +64,6 @@ class TaskResponse(BaseModel):
     depends_on_past: bool
     wait_for_downstream: bool
     retries: float | None
-    infra_retries: int
     queue: str | None
     pool: str | None
     pool_slots: float | None

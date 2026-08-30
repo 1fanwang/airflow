@@ -18,16 +18,16 @@ from __future__ import annotations
 
 import pytest
 
-from airflow._shared.state import INFRA_RETRIES_USED_STATE_KEY, TaskFailureKind, TaskScope
+from airflow._shared.state import TaskFailureKind
 from airflow.callbacks.callback_requests import TaskCallbackRequest
 from airflow.jobs.job import Job
 from airflow.jobs.scheduler_job_runner import SchedulerJobRunner
 from airflow.listeners import hookimpl
 from airflow.models.dagrun import DagRunState
 from airflow.providers.standard.operators.empty import EmptyOperator
-from airflow.state.metastore import _get_db_backend
 from airflow.utils.state import State, TaskInstanceState
 
+from tests_common.test_utils.config import conf_vars
 from tests_common.test_utils.mock_executor import MockExecutor
 
 pytestmark = pytest.mark.db_test
@@ -52,6 +52,7 @@ pytestmark = pytest.mark.db_test
         ("unclassified", None, TaskInstanceState.FAILED, 0),
     ],
 )
+@conf_vars({("core", "max_infra_retries"): "1"})
 def test_executor_cause_reaches_scheduler_and_consumers(
     name,
     failure_info,
@@ -80,7 +81,6 @@ def test_executor_cause_reaches_scheduler_and_consumers(
         task = EmptyOperator(
             task_id="task",
             retries=0,
-            infra_retries=1,
             on_retry_callback=lambda context: None,
             on_failure_callback=lambda context: None,
         )
@@ -120,12 +120,3 @@ def test_executor_cause_reaches_scheduler_and_consumers(
         expected_failure_info[0].value if expected_failure_info[0] is not None else None
     )
     assert request.context_from_server.failure_reason == expected_failure_info[1]
-
-    scope = TaskScope(
-        dag_id=ti.dag_id,
-        run_id=ti.run_id,
-        task_id=ti.task_id,
-        map_index=ti.map_index,
-    )
-    expected_count = "1" if expected_failure_info[0] == TaskFailureKind.INFRA else None
-    assert _get_db_backend().get(scope, INFRA_RETRIES_USED_STATE_KEY, session=session) == expected_count
