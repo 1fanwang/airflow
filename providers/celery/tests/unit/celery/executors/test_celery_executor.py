@@ -52,6 +52,7 @@ from tests_common.test_utils.version_compat import (
     AIRFLOW_V_3_1_PLUS,
     AIRFLOW_V_3_2_PLUS,
     AIRFLOW_V_3_3_PLUS,
+    AIRFLOW_V_3_4_PLUS,
 )
 
 try:
@@ -1665,3 +1666,98 @@ class TestCreateCeleryAppTeamIsolation:
         team_conf = ExecutorConf(team_name="team_beta")
         celery_app = celery_executor_utils.create_celery_app(team_conf)
         assert "team_beta" in celery_app.main
+
+
+@pytest.mark.skipif(not AIRFLOW_V_3_4_PLUS, reason="Executor failure reasons require Airflow 3.4+")
+@pytest.mark.parametrize("state", ["FAILURE", "REVOKED"])
+def test_worker_lost_is_reason_only_for_task_instances(state: str) -> None:
+    from billiard.exceptions import WorkerLostError
+
+    from airflow.models.callback import CallbackKey
+
+    executor = CeleryExecutor.__new__(CeleryExecutor)
+    executor.fail = mock.create_autospec(executor.fail)
+
+    lost = TaskInstanceKey("d", "t", "r", 1)
+    app_bug = TaskInstanceKey("d", "t2", "r", 1)
+    callback = CallbackKey("12345678-1234-5678-1234-567812345678")
+    lost_error = WorkerLostError("signal 9 (SIGKILL)")
+    app_error = ValueError("application reported signal 9 (SIGKILL)")
+    callback_error = WorkerLostError("callback worker lost")
+
+    executor.update_task_state(lost, state, lost_error)
+    executor.update_task_state(app_bug, state, app_error)
+    executor.update_task_state(callback, state, callback_error)
+
+    assert executor.fail.call_args_list == [
+        mock.call(lost, lost_error, reason="WorkerLost"),
+        mock.call(app_bug, app_error),
+        mock.call(callback, callback_error),
+    ]
+
+
+def test_worker_lost_uses_legacy_fail_signature_before_airflow_3_4() -> None:
+    from billiard.exceptions import WorkerLostError
+    from celery import states as _states
+
+    executor = CeleryExecutor.__new__(CeleryExecutor)
+
+    def legacy_fail(key: TaskInstanceKey, info: object = None) -> None:
+        pass
+
+    executor.fail = mock.create_autospec(legacy_fail)
+    key = TaskInstanceKey("d", "t", "r", 1)
+    error = WorkerLostError("signal 9 (SIGKILL)")
+
+    with mock.patch.object(celery_executor, "AIRFLOW_V_3_4_PLUS", False):
+        executor.update_task_state(key, _states.FAILURE, error)
+
+    executor.fail.assert_called_once_with(key, error)
+
+
+def test_bulk_fetcher_surfaces_exception_as_info() -> None:
+    from billiard.exceptions import WorkerLostError
+    from celery import states as _states
+
+    from airflow.providers.celery.executors.celery_executor_utils import BulkStateFetcher
+
+    exc = WorkerLostError("Worker exited prematurely: signal 9 (SIGKILL) Job: 0.")
+    failure = {
+        "task_id": "failed",
+        "status": _states.FAILURE,
+        "result": exc,
+        "traceback": "tb",
+        "date_done": None,
+    }
+    success = {
+        "task_id": "succeeded",
+        "status": _states.SUCCESS,
+        "result": "return value",
+        "traceback": None,
+        "date_done": None,
+    }
+    out = BulkStateFetcher._prepare_state_and_info_by_task_dict(
+        {"failed", "succeeded"},
+        {"failed": failure, "succeeded": success},
+    )
+    state, info = out["failed"]
+
+    assert state == _states.FAILURE
+    assert info is exc
+    assert type(info).__name__ == "WorkerLostError"
+    assert out["succeeded"] == (_states.SUCCESS, None)
+
+
+@pytest.mark.parametrize("info", ["existing failure info", "", False])
+def test_bulk_fetcher_preserves_explicit_info(info: str | bool) -> None:
+    from billiard.exceptions import WorkerLostError
+    from celery import states as _states
+
+    from airflow.providers.celery.executors.celery_executor_utils import BulkStateFetcher
+
+    result = BulkStateFetcher._prepare_state_and_info_by_task_dict(
+        {"failed"},
+        {"failed": {"status": _states.FAILURE, "info": info, "result": WorkerLostError("signal 9")}},
+    )
+
+    assert result["failed"] == (_states.FAILURE, info)
