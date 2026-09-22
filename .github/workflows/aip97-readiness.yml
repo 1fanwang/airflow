@@ -1,0 +1,96 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+---
+name: Validate combined failure policy
+run-name: Validate combined failure policy at 5b35d594b449
+on:  # yamllint disable-line rule:truthy
+  push:
+    branches:
+      - 1fannnw/aip97-66405-validation
+    paths:
+      - .github/workflows/aip97-readiness.yml
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 5b35d594b4492a2ba96609e7e94db1ab87a68b4a
+      PYTHON_VERSION: "3.12"
+    steps:
+      - name: Check out the exact source candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 5b35d594b4492a2ba96609e7e94db1ab87a68b4a
+          persist-credentials: false
+      - name: Record source identity
+        run: |
+          mkdir -p validation-logs
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git show --no-patch --format=fuller HEAD | tee validation-logs/source.log
+          git rev-parse HEAD HEAD^{tree} | tee -a validation-logs/source.log
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+      - name: Install the repository's locked Breeze environment
+        run: |
+          UV_VERSION=$(sed -n '/^name = "uv"$/{n;s/^version = "\(.*\)"$/\1/p;}' uv.lock)
+          test -n "$UV_VERSION"
+          pip install "uv==$UV_VERSION"
+          ./scripts/ci/install_breeze.sh
+      - name: Pull the public CI image
+        run: |
+          set -o pipefail
+          breeze ci-image pull --python 3.12 --github-repository apache/airflow \
+            2>&1 | tee validation-logs/image.log
+          docker image inspect ghcr.io/apache/airflow/main/ci/python3.12 \
+            --format '{{json .RepoDigests}}' | tee validation-logs/image-digest.log
+      - name: Execute core, provider, and SDK failure paths
+        run: |
+          set -o pipefail
+          breeze run --python 3.12 --backend postgres --github-repository apache/airflow \
+            --skip-image-upgrade-check --answer no bash -euc '
+              set -x
+              pytest --with-db-init \
+                airflow-core/tests/integration/executors/test_failure_cause.py \
+                airflow-core/tests/unit/models/test_taskinstance_infra_retry.py \
+                airflow-core/tests/unit/executors/test_base_executor.py \
+                airflow-core/tests/unit/listeners/test_listener_types.py -q
+              pytest airflow-core/tests/unit/jobs/test_scheduler_job.py \
+                -k "process_executor_events or external_kill or email" -q
+              pytest airflow-core/tests/unit/models/test_taskinstance.py \
+                -k "handle_failure or is_eligible_to_retry" -q
+              (
+                cd providers/cncf/kubernetes
+                pytest tests/unit/cncf/kubernetes/executors/test_classify_pod_failure.py \
+                  tests/unit/cncf/kubernetes/executors/test_kubernetes_executor.py \
+                  tests/unit/cncf/kubernetes/executors/test_kubernetes_executor_utils.py -q
+              )
+              pytest task-sdk/tests/task_sdk/execution_time/test_task_runner.py \
+                -k "listener or failure or metrics or retry or timeout" -q
+            ' 2>&1 | tee validation-logs/runtime.log
+      - name: Retain source identity and raw runtime output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: combined-failure-policy-5b35d594b449
+          path: validation-logs/
+          retention-days: 14
+          if-no-files-found: error
