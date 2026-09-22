@@ -1,0 +1,493 @@
+diff --git a/original/probe.py b/updated/probe.py
+index 9bc7037..a2c9efa 100644
+--- a/original/probe.py
++++ b/updated/probe.py
+@@ -71,11 +71,15 @@ def probe() -> None:
+                 "bytes": Path("/limited-storage/payload").stat().st_size,
+             }
+             (EVIDENCE / f"storage-{key}.json").write_text(json.dumps(event))
+             print("AIP97_STORAGE_WRITTEN " + json.dumps(event), flush=True)
+             written = True
+-        elif mode not in {"storage", "infra", "timeout", "manual"} and (EVIDENCE / f"release-{key}").exists():
++        elif (
++            mode not in {"storage", "timeout", "manual"}
++            and (mode != "infra" or ti.try_number > 1)
++            and (EVIDENCE / f"release-{key}").exists()
++        ):
+             if mode == "application" or (mode == "retry" and ti.try_number == 1):
+                 raise RuntimeError("AIP97 classification application control")
+             return
+         time.sleep(0.25)
+     raise RuntimeError("The local validation controller did not finish its scenario")
+diff --git a/original/run.py b/updated/run.py
+index 78c952b..1dccce1 100644
+--- a/original/run.py
++++ b/updated/run.py
+@@ -87,11 +87,20 @@ def export_source(source: Path, *, commit: str, build: Path, env: dict[str, str]
+     (build / "source-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+     for name in FILES:
+         shutil.copyfile(src=ROOT / name, dst=build / name)
+
+
+-def phase(*, source: Path, commit: str, classified: bool, folder: Path, project: str, env: dict[str, str]) -> dict[str, Any]:
++def phase(
++    *,
++    source: Path,
++    commit: str,
++    classified: bool,
++    policy_cap: int | None,
++    folder: Path,
++    project: str,
++    env: dict[str, str],
++) -> dict[str, Any]:
+     folder.mkdir()
+     runtime: Path = folder / "runtime"
+     runtime.mkdir()
+     image: str = f"{project}:source"
+     database: str = project.replace("-", "_")
+@@ -101,13 +110,18 @@ def phase(*, source: Path, commit: str, classified: bool, folder: Path, project:
+     handles: list[Any] = []
+     cids: list[Path] = []
+     cluster_ids: list[str] = []
+     ownership: dict[str, Any] = {
+         "project": project, "commit": commit, "classification_expected": classified,
++        "policy_cap": policy_cap,
+         "database": database, "postgres_container": f"{project}-db",
+         "postgres_storage": "private tmpfs; no Docker volume",
+     }
++    available_cpus: int | None = os.cpu_count()
++    if available_cpus is None:
++        raise RuntimeError("The validation host did not report its CPU count")
++    ownership["available_cpus"] = available_cpus
+     local_env: dict[str, str] = {
+         **env, "KIND_EXPERIMENTAL_DOCKER_NETWORK": project,
+         "KUBECONFIG": str(runtime / "kubeconfig-host"),
+     }
+     try:
+@@ -137,11 +151,15 @@ def phase(*, source: Path, commit: str, classified: bool, folder: Path, project:
+         cluster_ids = invoke([
+             "docker", "ps", "-aq", "--filter", f"label=io.x-k8s.kind.cluster={project}",
+         ], env=local_env, folder=folder).splitlines()
+         assert len(cluster_ids) == 1, cluster_ids
+         ownership["kind_container_ids"] = cluster_ids
+-        invoke(["docker", "update", "--cpus=4", "--memory=6g", "--memory-swap=6g", cluster_ids[0]], env=local_env, folder=folder)
++        invoke(
++            argv=["docker", "update", f"--cpus={min(4, available_cpus)}", "--memory=6g", "--memory-swap=6g", cluster_ids[0]],
++            env=local_env,
++            folder=folder,
++        )
+         ownership["kind_image_id"] = invoke([
+             "docker", "inspect", "--format={{.Image}}", cluster_ids[0],
+         ], env=local_env, folder=folder)
+         (runtime / "kubeconfig").write_text(invoke([
+             "kind", "get", "kubeconfig", "--name", project, "--internal",
+@@ -154,14 +172,15 @@ def phase(*, source: Path, commit: str, classified: bool, folder: Path, project:
+                 "--env", "PGDATA=/var/lib/postgresql/data",
+                 "--env", "POSTGRES_USER=airflow", "--env", f"POSTGRES_DB={database}",
+                 "--env", "POSTGRES_HOST_AUTH_METHOD=trust", "postgres:16-bookworm",
+             ]),
+             ("runtime", [
+-                "--cpus=3", "--memory=4g", "--volume", f"{runtime}:/validation",
++                f"--cpus={min(3, available_cpus)}", "--memory=4g", "--volume", f"{runtime}:/validation",
+                 "--env", f"AIP97_PROJECT={project}", "--env", f"AIP97_IMAGE={image}",
+                 "--env", f"AIP97_DATABASE={database}",
+                 "--env", f"AIP97_SOURCE_COMMIT={commit}",
++                "--env", f"AIP97_POLICY_CAP={policy_cap if policy_cap is not None else ''}",
+                 "--env", f"AIP97_CLASSIFICATION={int(classified)}", image,
+             ]),
+         ):
+             cid: Path = folder / f"{service}.cid"
+             cids.append(cid)
+@@ -295,10 +314,11 @@ def main() -> None:
+     parser: argparse.ArgumentParser = argparse.ArgumentParser(
+         description="Run the public AIP-97 Kubernetes fixture against two immutable source commits."
+     )
+     parser.add_argument("--source", type=Path)
+     parser.add_argument("--commit", help="Frozen 40-hex candidate commit; never defaults to the working tree")
++    parser.add_argument("--policy", action="store_true", help="Also validate the combined policy at its default and with cap one")
+     parser.add_argument("--emit-recipe", action="store_true", help="Inline all fixture files without starting services")
+     args: argparse.Namespace = parser.parse_args()
+     if args.emit_recipe:
+         emit_recipe()
+         return
+@@ -333,22 +353,34 @@ def main() -> None:
+     ], env=env, folder=folder)
+     (folder / "fixture-manifest.json").write_text(json.dumps({
+         name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in ("run.py", *FILES)
+     }, indent=2) + "\n")
+     results: list[dict[str, Any]] = []
+-    for label, commit, classified in (("baseline", BASE, False), ("candidate", args.commit, True)):
++    phases: list[tuple[str, str, bool, int | None]] = [
++        ("baseline", BASE, False, None),
++        ("candidate", args.commit, True, 0 if args.policy else None),
++    ]
++    if args.policy:
++        phases.append(("policy-enabled", args.commit, True, 1))
++    for label, commit, classified, policy_cap in phases:
+         print(f"Running {label} {commit}; artifacts: {folder / label}", flush=True)
+         results.append(phase(
+             source=args.source.resolve(), commit=commit, classified=classified,
++            policy_cap=policy_cap,
+             folder=folder / label, project=f"aip97-classification-72ef-{suffix}-{label}",
+             env=env,
+         ))
+     assert results[0]["behavior"] == results[1]["behavior"], "Retry, clear or callback behavior differs from baseline"
++    if args.policy:
++        for case in results[1]["behavior"]:
++            if case != "infra":
++                assert results[1]["behavior"][case] == results[2]["behavior"][case], case
+     (folder / "comparison.json").write_text(json.dumps({
+         "baseline": BASE, "candidate": args.commit, "behavior_equal": True,
+         "behavior": results[1]["behavior"], "passed": True,
++        "policy_enabled": args.policy,
+     }, indent=2) + "\n")
+-    print(f"Both live runs passed; unchanged retry/clear behavior: {folder / 'comparison.json'}", flush=True)
++    print(f"All requested live runs passed; default retry/clear comparison: {folder / 'comparison.json'}", flush=True)
+
+
+ if __name__ == "__main__":
+     main()
+diff --git a/original/run_live.py b/updated/run_live.py
+index 4fa793a..81fceda 100644
+--- a/original/run_live.py
++++ b/updated/run_live.py
+@@ -47,10 +47,14 @@ def records(path: Path) -> list[dict[str, Any]]:
+ def main() -> None:
+     project: str = os.environ["AIP97_PROJECT"]
+     database: str = os.environ["AIP97_DATABASE"]
+     image: str = os.environ["AIP97_IMAGE"]
+     classified: bool = os.environ["AIP97_CLASSIFICATION"] == "1"
++    raw_policy_cap: str = os.environ.get("AIP97_POLICY_CAP", "")
++    policy_cap: int | None = int(raw_policy_cap) if raw_policy_cap else None
++    if policy_cap not in (None, 0, 1):
++        raise ValueError(f"Unsupported validation policy cap: {policy_cap}")
+     node: str = f"{project}-control-plane"
+     ip: str = socket.gethostbyname(socket.gethostname())
+     for child in ("home", "evidence", "dags", "plugins", "bundles", "logs", "worker-home", "scratch"):
+         (ROOT / child).mkdir()
+     shutil.copyfile(src="/recipe/probe.py", dst=ROOT / "dags/probe.py")
+@@ -100,10 +104,12 @@ def main() -> None:
+         "AIRFLOW__METRICS__STATSD_PORT": "8125",
+         "AIRFLOW__METRICS__STATSD_PREFIX": "aip97",
+         "AIRFLOW__METRICS__STATSD_DATADOG_ENABLED": "True",
+     }
+     assert not any("MAX_INFRA_RETRIES" in name for name in env)
++    if policy_cap == 1:
++        env["AIRFLOW__CORE__MAX_INFRA_RETRIES"] = "1"
+     os.environ.update(env)
+     worker_env: dict[str, str] = {
+         name: value for name, value in env.items()
+         if name.startswith(("AIRFLOW__LOGGING__", "AIRFLOW__METRICS__", "AIRFLOW__WORKERS__"))
+     }
+@@ -282,26 +288,38 @@ def main() -> None:
+             module: Any = importlib.import_module(name)
+             digest: str = hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+             assert digest in manifest["files"].values(), (name, digest)
+             imported[name] = digest
+         configuration: Any = importlib.import_module("airflow.configuration").conf
+-        assert not configuration.has_option("core", "max_infra_retries")
++        assert configuration.has_option("core", "max_infra_retries") is (policy_cap is not None)
++        if policy_cap is not None:
++            assert configuration.getint("core", "max_infra_retries") == policy_cap
+         public_enum: dict[str, Any] | None = None
+         if classified:
+             executor_module: Any = importlib.import_module("airflow.executors.base_executor")
+             provider_module: Any = importlib.import_module(
+                 "airflow.providers.cncf.kubernetes.executors.kubernetes_executor_utils"
+             )
+-            assert provider_module.TaskFailureKind is executor_module.TaskFailureKind
++            if policy_cap is None:
++                assert provider_module.TaskFailureKind is executor_module.TaskFailureKind
++                enum_api: str = "airflow.executors.base_executor.TaskFailureKind"
++                failure_enum: Any = executor_module.TaskFailureKind
++            else:
++                failure_enum = importlib.import_module("airflow._shared.state").TaskFailureKind
++                assert provider_module.classify_pod_failure(
++                    failure_details={"disruption_reason": "DeletionByTaintManager"}
++                )[0] is failure_enum.INFRA
++                enum_api = "airflow._shared.state.TaskFailureKind"
+             public_enum = {
+-                "api": "airflow.executors.base_executor.TaskFailureKind",
++                "api": enum_api,
+                 "provider_uses_same_object": True,
+-                "values": [kind.value for kind in executor_module.TaskFailureKind],
++                "values": [kind.value for kind in failure_enum],
+             }
+         (EVIDENCE / "source-identity.json").write_text(json.dumps({
+             "commit": manifest["commit"], "tree": manifest["tree"], "imported": imported,
+-            "max_infra_retries_option_present": False,
++            "max_infra_retries_option_present": policy_cap is not None,
++            "policy_cap": policy_cap,
+             "public_enum": public_enum,
+         }, indent=2) + "\n")
+         for name, arguments in (
+             ("api", ["api-server", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]),
+             ("dag-processor", ["dag-processor"]),
+@@ -397,12 +415,20 @@ def main() -> None:
+             if case == "retry":
+                 wait_for(lambda: row if (row := snapshot(run_id=run_id)) and row["state"] == "up_for_retry" else None,
+                          "Configured ordinary retry")
+                 observations.append(await_running(run_id=run_id, attempt=2))
+                 (EVIDENCE / f"release-{run_id}-2").write_text(utc())
+-            terminal: dict[str, Any] = finished(run_id=run_id, state="success" if case == "retry" else "failed")
+-            assert (terminal["try_number"], terminal["max_tries"]) == ((2, 1) if case == "retry" else (1, 0))
++            replacement: bool = case == "infra" and policy_cap == 1
++            if replacement:
++                observations.append(await_running(run_id=run_id, attempt=2))
++                (EVIDENCE / f"release-{run_id}-2").write_text(utc())
++            terminal: dict[str, Any] = finished(
++                run_id=run_id, state="success" if case == "retry" or replacement else "failed"
++            )
++            assert (terminal["try_number"], terminal["max_tries"]) == (
++                (2, 1) if case == "retry" or replacement else (1, 0)
++            )
+             pre_clear: dict[str, Any] | None = None
+             if case == "retry":
+                 wait_for(lambda: http.get(
+                     url=f"http://127.0.0.1:8080/api/v2/dags/{dag_id}/dagRuns/{run_id}", timeout=5,
+                 ).json().get("state") == "success", "DagRun completes before terminal clear")
+@@ -475,26 +501,34 @@ def main() -> None:
+     api: list[dict[str, Any]] = records(path=ROOT / "api.log")
+     listeners: list[dict[str, Any]] = records(path=EVIDENCE / "listeners.jsonl")
+     callbacks: list[dict[str, Any]] = records(path=EVIDENCE / "callbacks.jsonl")
+     scheduler: list[dict[str, Any]] = records(path=ROOT / "scheduler.log")
+     counts: collections.Counter[tuple[str, str, str | None]] = collections.Counter()
++    policy_counts: collections.Counter[tuple[str, str]] = collections.Counter()
+     assert packets == records(path=EVIDENCE / "datagrams.jsonl")
+     for packet in packets:
+         raw: bytes = base64.b64decode(packet["base64"], validate=True)
+         assert len(raw) == packet["length"] and raw.decode() == packet["text"]
+         for line in packet["text"].splitlines():
+             name_value, *fields = line.split("|")
+             name, value = name_value.split(":", 1)
+-            assert "ti_infra_retry_granted" not in name and "ti_infra_retry_denied" not in name, line
+-            if name not in {"aip97.ti_failures", "aip97.operator_failures"}:
+-                continue
+             tags: dict[str, str] = {
+                 item.split(":", 1)[0]: item.split(":", 1)[1]
+                 for field in fields if field.startswith("#") for item in field[1:].split(",") if ":" in item
+             }
++            if name in {"aip97.ti_infra_retry_granted", "aip97.ti_infra_retry_denied"}:
++                assert policy_cap == 1 and fields[0] == "c", line
++                policy_counts[(tags["dag_id"], name)] += int(value)
++                continue
++            if name not in {"aip97.ti_failures", "aip97.operator_failures"}:
++                continue
+             assert fields[0] == "c"
+             counts[(tags["dag_id"], name, tags.get("failure_kind"))] += int(value)
++    assert policy_counts == (
++        {("aip97_classification_infra", "aip97.ti_infra_retry_granted"): 1}
++        if policy_cap == 1 else {}
++    ), policy_counts
+     behavior: dict[str, Any] = {}
+     for result in outcomes:
+         case = result["case"]
+         dag_id = result["dag_id"]
+         kind: str | None = {
+@@ -528,18 +562,25 @@ def main() -> None:
+                 for row in matching
+             )
+         sequence: list[str] = [row["callback"] for row in callbacks if row["run_id"] == result["run_id"]]
+         if case == "retry":
+             assert sequence == ["retry", "success", "success"], sequence
++        elif case == "infra" and policy_cap == 1:
++            assert sequence == ["retry", "success"], sequence
+         behavior[case] = {
+             "final": {key: result["final"][key] for key in ("state", "try_number", "max_tries")},
+             "before_clear": {key: result["pre_clear"][key] for key in ("state", "try_number", "max_tries")} if result["pre_clear"] else None,
+             "attempts": [row["first"]["try_number"] for row in result["observations"]],
+             "callbacks": sequence,
+         }
+     (ROOT / "result.json").write_text(json.dumps({
+         "passed": True, "commit": manifest["commit"], "classification_expected": classified,
++        "policy_cap": policy_cap,
++        "policy_counters": [
++            {"dag_id": dag, "metric": name, "count": count}
++            for (dag, name), count in sorted(policy_counts.items())
++        ],
+         "behavior": behavior, "udp_datagrams": len(packets),
+         "failure_counters": [{"dag_id": dag, "metric": name, "kind": kind, "count": count}
+                              for (dag, name, kind), count in sorted(counts.items(), key=str)],
+         "limits": [
+             "DogStatsD only; no live scheduler preemption, Celery or AWS claim.",
+diff --git a/original/verify_evidence.py b/updated/verify_evidence.py
+index e4b2a81..ba9bec5 100644
+--- a/original/verify_evidence.py
++++ b/updated/verify_evidence.py
+@@ -1,13 +1,13 @@
+ from __future__ import annotations
+
++import argparse
+ import base64
+ import collections
+ import datetime
+ import hashlib
+ import json
+-import sys
+ import tarfile
+ from pathlib import Path
+ from typing import Any
+
+ COMMITS: dict[str, str] = {
+@@ -23,14 +23,22 @@ def records(path: Path) -> list[dict[str, Any]]:
+ def instant(value: str) -> datetime.datetime:
+     return datetime.datetime.fromisoformat(value)
+
+
+ def main() -> None:
+-    root: Path = Path(sys.argv[1]).resolve()
++    parser: argparse.ArgumentParser = argparse.ArgumentParser()
++    parser.add_argument("root", type=Path)
++    parser.add_argument("--candidate", required=True)
++    parser.add_argument("--policy", action="store_true")
++    args: argparse.Namespace = parser.parse_args()
++    root: Path = args.root.resolve()
++    commits: dict[str, str] = {**COMMITS, "candidate": args.candidate}
++    if args.policy:
++        commits["policy-enabled"] = args.candidate
+     results: dict[str, Any] = {}
+     excerpts: list[str] = []
+-    for phase, commit in COMMITS.items():
++    for phase, commit in commits.items():
+         folder: Path = root / phase
+         runtime: Path = folder / "runtime"
+         evidence: Path = runtime / "evidence"
+         result: dict[str, Any] = json.loads((runtime / "result.json").read_text())
+         ownership: dict[str, Any] = json.loads((folder / "ownership.json").read_text())
+@@ -42,47 +50,60 @@ def main() -> None:
+         with tarfile.open(archive) as package:
+             assert package.pax_headers["comment"] == commit
+         for relative, digest in manifest["files"].items():
+             assert hashlib.sha256((folder / "build/source" / relative).read_bytes()).hexdigest() == digest
+         assert set(identity["imported"].values()) <= set(manifest["files"].values())
+-        assert not identity["max_infra_retries_option_present"]
+-        if phase == "candidate":
++        policy_cap: int | None = None if phase == "baseline" or not args.policy else (
++            1 if phase == "policy-enabled" else 0
++        )
++        assert identity["max_infra_retries_option_present"] is (policy_cap is not None)
++        assert identity["policy_cap"] == policy_cap
++        if phase != "baseline":
+             assert identity["public_enum"]["provider_uses_same_object"]
+         storage: dict[str, Any] = ownership["postgres_storage_inspection"]
+         assert "/var/lib/postgresql/data" in storage["tmpfs"] and not storage["mounts"] and not storage["ports"]
+         driver: list[dict[str, Any]] = records(path=folder / "runtime.log")
+         assert next(row for row in driver if row.get("event") == "DATABASE_IDENTITY")["database"] == ownership["database"]
+         cleanup: dict[str, Any] = json.loads((folder / "cleanup.json").read_text())
+         assert not cleanup["errors"] and not cleanup["remaining_containers"] and not cleanup["remaining_kind_nodes"]
+         assert not json.loads((runtime / "process-cleanup.json").read_text())["remaining_owned_pids"]
+         packets: list[dict[str, Any]] = records(path=evidence / "datagrams.jsonl")
+         counts: collections.Counter[tuple[str, str, str | None]] = collections.Counter()
++        policy_counts: collections.Counter[tuple[str, str]] = collections.Counter()
+         emitted: list[str] = []
+         for packet in packets:
+             raw: bytes = base64.b64decode(packet["base64"], validate=True)
+             assert len(raw) == packet["length"] and raw.decode() == packet["text"]
+             for line in packet["text"].splitlines():
+                 metric_value, *fields = line.split("|")
+                 metric, value = metric_value.split(":", 1)
+-                assert "ti_infra_retry_granted" not in metric and "ti_infra_retry_denied" not in metric
+-                if metric not in {"aip97.ti_failures", "aip97.operator_failures"}:
+-                    continue
+                 tags: dict[str, str] = dict(
+                     tag.split(":", 1) for field in fields if field.startswith("#")
+                     for tag in field[1:].split(",") if ":" in tag
+                 )
++                if metric in {"aip97.ti_infra_retry_granted", "aip97.ti_infra_retry_denied"}:
++                    assert policy_cap == 1 and fields[0] == "c"
++                    policy_counts[(tags["dag_id"], metric)] += int(value)
++                    emitted.append(line)
++                    continue
++                if metric not in {"aip97.ti_failures", "aip97.operator_failures"}:
++                    continue
+                 assert fields[0] == "c"
+                 counts[(tags["dag_id"], metric, tags.get("failure_kind"))] += int(value)
+                 emitted.append(line)
+         expected: collections.Counter[tuple[str, str, str | None]] = collections.Counter()
+         for case, kind in (
+             ("infra", "infra"), ("storage", "unclassified"),
+             ("application", "application"), ("timeout", "timeout"), ("retry", "application"),
+         ):
+             for metric in ("aip97.ti_failures", "aip97.operator_failures"):
+-                expected[(f"aip97_classification_{case}", metric, kind if phase == "candidate" else None)] = 1
++                expected[(f"aip97_classification_{case}", metric, kind if phase != "baseline" else None)] = 1
+         assert counts == expected
++        assert policy_counts == (
++            {("aip97_classification_infra", "aip97.ti_infra_retry_granted"): 1}
++            if policy_cap == 1 else {}
++        )
+         api: list[dict[str, Any]] = records(path=runtime / "api.log")
+         outcomes: list[dict[str, Any]] = json.loads((evidence / "outcomes.json").read_text())
+         states: list[dict[str, Any]] = records(path=evidence / "task-states.jsonl")
+         starts: list[dict[str, Any]] = []
+         pod_images: set[str] = set()
+@@ -106,15 +127,19 @@ def main() -> None:
+                 starts.append({
+                     "case": case["case"], "attempt": first["try_number"], "ti_id": first["id"],
+                     "start": start, "later_heartbeat": heartbeat,
+                 })
+                 pod_images.add(observed["image_id"])
+-            if case["case"] != "retry":
++            replacement: bool = case["case"] == "infra" and policy_cap == 1
++            if replacement:
++                assert case["final"]["state"] == "success"
++                assert (case["final"]["try_number"], case["final"]["max_tries"]) == (2, 1)
++            elif case["case"] != "retry":
+                 snapshots: list[dict[str, Any]] = [row["ti"] for row in states if row["ti"]["run_id"] == case["run_id"]]
+                 assert snapshots and all(row["max_tries"] == 0 and row["try_number"] <= 1 for row in snapshots)
+                 assert case["final"]["state"] == "failed"
+-        assert len(starts) == 8 and len(pod_images) == 1
++        assert len(starts) == (9 if policy_cap == 1 else 8) and len(pod_images) == 1
+         infra: dict[str, Any] = next(case for case in outcomes if case["case"] == "infra")
+         infra_name: str = infra["observations"][0]["pod"]
+         disrupted: dict[str, Any] = json.loads((evidence / f"{infra_name}-disruption.json").read_text())
+         terminated: dict[str, Any] = json.loads((evidence / f"{infra_name}-final.json").read_text())
+         assert disrupted["termination_grace_period_seconds"] == disrupted["metadata"]["deletionGracePeriodSeconds"] == 30
+@@ -129,11 +154,12 @@ def main() -> None:
+         assert instant(write["utc"]) > instant(storage_observation["later"]["last_heartbeat_at"])
+         assert not any(row["type"] == "DisruptionTarget" and row["status"] == "True" for row in eviction["status"]["conditions"])
+         results[phase] = {
+             "commit": commit, "tree": manifest["tree"], "image_id": ownership["image_id"],
+             "pod_image_ids": sorted(pod_images), "verified_source_files": len(manifest["files"]),
+-            "raw_udp_datagrams": len(packets), "each_failure_counter": 5, "policy_counter_packets": 0,
++            "raw_udp_datagrams": len(packets), "each_failure_counter": 5,
++            "policy_counter_packets": sum(policy_counts.values()),
+             "authenticated_starts_with_later_heartbeats": starts,
+             "listeners": records(path=evidence / "listeners.jsonl"),
+             "behavior": result["behavior"], "database": ownership["database"], "storage": storage,
+             "cleanup": cleanup,
+         }
+@@ -145,23 +171,30 @@ def main() -> None:
+                 excerpts.append(line)
+         excerpts.extend((evidence / "listeners.jsonl").read_text().splitlines())
+         excerpts.extend(emitted)
+         excerpts.extend(json.dumps(row, sort_keys=True) for row in starts)
+     assert results["baseline"]["behavior"] == results["candidate"]["behavior"]
++    if args.policy:
++        for case in results["candidate"]["behavior"]:
++            if case != "infra":
++                assert results["candidate"]["behavior"][case] == results["policy-enabled"]["behavior"][case]
+     report: dict[str, Any] = {
+         "verified_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+-        "passed": True, "cases": 12, "attempts": 16, "behavior_equal": True,
++        "passed": True, "cases": 6 * len(results),
++        "attempts": sum(len(row["authenticated_starts_with_later_heartbeats"]) for row in results.values()),
++        "behavior_equal_with_disabled_policy": True,
+         "total_udp_datagrams": sum(row["raw_udp_datagrams"] for row in results.values()),
+         "phases": results,
+     }
+     (root / "independent-verification.json").write_text(json.dumps(report, indent=2) + "\n")
+     (root / "evidence-excerpts.log").write_text("\n".join(excerpts) + "\n")
+     print(json.dumps({
+-        "passed": True, "cases": 12, "attempts": 16, "behavior_equal": True,
++        "passed": True, "cases": report["cases"], "attempts": report["attempts"],
++        "behavior_equal_with_disabled_policy": True,
+         "total_udp_datagrams": report["total_udp_datagrams"],
+         "candidate_udp_datagrams": results["candidate"]["raw_udp_datagrams"],
+-        "policy_counter_packets": 0,
++        "policy_counter_packets": sum(row["policy_counter_packets"] for row in results.values()),
+     }, indent=2))
+
+
+ if __name__ == "__main__":
+     main()
