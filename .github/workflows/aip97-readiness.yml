@@ -43,11 +43,21 @@ jobs:
       CANDIDATE: ${{ matrix.candidate }}
       SOURCE_SHA: ${{ matrix.source-sha }}
       PYTHON_VERSION: "3.12"
+    defaults:
+      run:
+        working-directory: source
     steps:
+      - name: Check out the validation instructions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: control
+          persist-credentials: false
       - name: Check out the exact source candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          repository: 1fanwang/airflow
           ref: ${{ matrix.source-sha }}
+          path: source
           persist-credentials: false
       - name: Record source identity
         run: |
@@ -55,6 +65,12 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           git show --no-patch --format=fuller HEAD | tee validation-logs/source.log
           git rev-parse HEAD HEAD^{tree} | tee -a validation-logs/source.log
+          cp ../control/.github/workflows/aip97-readiness.yml validation-logs/workflow.yml
+          sha256sum validation-logs/workflow.yml | tee validation-logs/workflow-sha256.log
+          uname -srm | tee validation-logs/runner.log
+          nproc | tee -a validation-logs/runner.log
+          free -h | tee -a validation-logs/runner.log
+          df -h . | tee -a validation-logs/runner.log
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
@@ -102,6 +118,6 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ${{ matrix.candidate }}-${{ matrix.source-sha }}
-          path: validation-logs/
+          path: source/validation-logs/
           retention-days: 14
           if-no-files-found: error
