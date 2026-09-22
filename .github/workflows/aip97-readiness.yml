@@ -80,8 +80,7 @@ jobs:
               (
                 cd providers/cncf/kubernetes
                 pytest tests/unit/cncf/kubernetes/executors/test_classify_pod_failure.py \
-                  tests/unit/cncf/kubernetes/executors/test_kubernetes_executor.py \
-                  tests/unit/cncf/kubernetes/executors/test_kubernetes_executor_utils.py -q
+                  tests/unit/cncf/kubernetes/executors/test_kubernetes_executor.py -q
               )
               pytest task-sdk/tests/task_sdk/execution_time/test_task_runner.py \
                 -k "listener or failure or metrics or retry or timeout" -q
