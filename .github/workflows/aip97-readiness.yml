@@ -15,8 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 ---
-name: Validate combined failure policy
-run-name: Validate combined failure policy at 5b35d594b449
+name: Validate failure reporting candidates
+run-name: Validate the combined and classification candidates
 on:  # yamllint disable-line rule:truthy
   push:
     branches:
@@ -28,16 +28,26 @@ permissions:
 
 jobs:
   runtime:
+    name: Validate ${{ matrix.candidate }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - candidate: combined
+            source-sha: 5b35d594b4492a2ba96609e7e94db1ab87a68b4a
+          - candidate: classification
+            source-sha: 863bc207d6a052a4f5d0573ead077e803c79664f
     env:
-      SOURCE_SHA: 5b35d594b4492a2ba96609e7e94db1ab87a68b4a
+      CANDIDATE: ${{ matrix.candidate }}
+      SOURCE_SHA: ${{ matrix.source-sha }}
       PYTHON_VERSION: "3.12"
     steps:
       - name: Check out the exact source candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 5b35d594b4492a2ba96609e7e94db1ab87a68b4a
+          ref: ${{ matrix.source-sha }}
           persist-credentials: false
       - name: Record source identity
         run: |
@@ -69,10 +79,12 @@ jobs:
             --skip-image-upgrade-check --answer no bash -euc '
               set -x
               pytest --with-db-init \
-                airflow-core/tests/integration/executors/test_failure_cause.py \
-                airflow-core/tests/unit/models/test_taskinstance_infra_retry.py \
                 airflow-core/tests/unit/executors/test_base_executor.py \
                 airflow-core/tests/unit/listeners/test_listener_types.py -q
+              if [[ "$1" == "combined" ]]; then
+                pytest airflow-core/tests/integration/executors/test_failure_cause.py \
+                  airflow-core/tests/unit/models/test_taskinstance_infra_retry.py -q
+              fi
               pytest airflow-core/tests/unit/jobs/test_scheduler_job.py \
                 -k "process_executor_events or external_kill or email" -q
               pytest airflow-core/tests/unit/models/test_taskinstance.py \
@@ -84,12 +96,12 @@ jobs:
               )
               pytest task-sdk/tests/task_sdk/execution_time/test_task_runner.py \
                 -k "listener or failure or metrics or retry or timeout" -q
-            ' 2>&1 | tee validation-logs/runtime.log
+            ' -- "$CANDIDATE" 2>&1 | tee validation-logs/runtime.log
       - name: Retain source identity and raw runtime output
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: combined-failure-policy-5b35d594b449
+          name: ${{ matrix.candidate }}-${{ matrix.source-sha }}
           path: validation-logs/
           retention-days: 14
           if-no-files-found: error
