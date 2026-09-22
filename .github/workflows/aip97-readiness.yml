@@ -112,7 +112,7 @@ jobs:
               )
               pytest task-sdk/tests/task_sdk/execution_time/test_task_runner.py \
                 -k "listener or failure or metrics or retry or timeout" -q
-            ' -- "$CANDIDATE" 2>&1 | tee validation-logs/runtime.log
+            ' validation "$CANDIDATE" 2>&1 | tee validation-logs/runtime.log
       - name: Retain source identity and raw runtime output
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
