@@ -16,7 +16,7 @@
 # under the License.
 ---
 name: Validate failure reporting candidates
-run-name: Validate the combined and classification candidates
+run-name: Validate the refreshed combined candidate
 on:  # yamllint disable-line rule:truthy
   push:
     branches:
@@ -36,9 +36,7 @@ jobs:
       matrix:
         include:
           - candidate: combined
-            source-sha: 5b35d594b4492a2ba96609e7e94db1ab87a68b4a
-          - candidate: classification
-            source-sha: 863bc207d6a052a4f5d0573ead077e803c79664f
+            source-sha: e78e62c0510451f063d14f5f30bb1dcfe093d151
     env:
       CANDIDATE: ${{ matrix.candidate }}
       SOURCE_SHA: ${{ matrix.source-sha }}
