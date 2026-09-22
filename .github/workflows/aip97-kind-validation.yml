@@ -16,7 +16,7 @@
 # under the License.
 ---
 name: Validate failure reporting on Kubernetes
-run-name: Exercise the refreshed combined source on Kubernetes and PostgreSQL
+run-name: Exercise the combined source on pinned upstream 63b615b25258
 on:  # yamllint disable-line rule:truthy
   push:
     branches:
@@ -37,7 +37,7 @@ jobs:
       matrix:
         include:
           - candidate: combined
-            source-sha: e78e62c0510451f063d14f5f30bb1dcfe093d151
+            source-sha: 77b67ade969b160f7550437e6b5108926d3ecc15
     env:
       CANDIDATE: ${{ matrix.candidate }}
       SOURCE_SHA: ${{ matrix.source-sha }}
