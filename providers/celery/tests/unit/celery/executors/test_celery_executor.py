@@ -1673,13 +1673,13 @@ class TestCreateCeleryAppTeamIsolation:
 
 @pytest.mark.skipif(not AIRFLOW_V_3_4_PLUS, reason="Executor failure reasons require Airflow 3.4+")
 @pytest.mark.parametrize("state", ["FAILURE", "REVOKED"])
-def test_worker_lost_is_reason_only_for_task_instances(state: str) -> None:
+@mock.patch.object(CeleryExecutor, "fail", autospec=True)
+def test_worker_lost_is_reason_only_for_task_instances(mock_fail: mock.MagicMock, state: str) -> None:
     from billiard.exceptions import WorkerLostError
 
     from airflow.models.callback import CallbackKey
 
     executor = CeleryExecutor.__new__(CeleryExecutor)
-    executor.fail = mock.create_autospec(executor.fail)
 
     lost = TaskInstanceKey("d", "t", "r", 1)
     app_bug = TaskInstanceKey("d", "t2", "r", 1)
@@ -1692,13 +1692,14 @@ def test_worker_lost_is_reason_only_for_task_instances(state: str) -> None:
     executor.update_task_state(app_bug, state, app_error)
     executor.update_task_state(callback, state, callback_error)
 
-    assert executor.fail.call_args_list == [
-        mock.call(key=lost, info=lost_error, reason="WorkerLost"),
-        mock.call(app_bug, app_error),
-        mock.call(callback, callback_error),
+    assert mock_fail.call_args_list == [
+        mock.call(executor, key=lost, info=lost_error, reason="WorkerLost"),
+        mock.call(executor, app_bug, app_error),
+        mock.call(executor, callback, callback_error),
     ]
 
 
+@mock.patch.object(celery_executor, "AIRFLOW_V_3_4_PLUS", False)
 def test_worker_lost_uses_legacy_fail_signature_before_airflow_3_4() -> None:
     from billiard.exceptions import WorkerLostError
     from celery import states as _states
@@ -1708,14 +1709,12 @@ def test_worker_lost_uses_legacy_fail_signature_before_airflow_3_4() -> None:
     def legacy_fail(key: TaskInstanceKey, info: object = None) -> None:
         pass
 
-    executor.fail = mock.create_autospec(legacy_fail)
     key = TaskInstanceKey("d", "t", "r", 1)
     error = WorkerLostError("signal 9 (SIGKILL)")
 
-    with mock.patch.object(celery_executor, "AIRFLOW_V_3_4_PLUS", False):
-        executor.update_task_state(key, _states.FAILURE, error)
-
-    executor.fail.assert_called_once_with(key, error)
+    with mock.patch.object(executor, "fail", autospec=legacy_fail) as mock_fail:
+        executor.update_task_state(key=key, state=_states.FAILURE, info=error)
+        mock_fail.assert_called_once_with(key, error)
 
 
 def test_bulk_fetcher_surfaces_exception_as_info() -> None:

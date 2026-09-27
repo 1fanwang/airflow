@@ -25,6 +25,7 @@ import signal
 import sys
 from ast import literal_eval
 from datetime import datetime, timedelta
+from pathlib import PurePosixPath
 from time import sleep
 from typing import TYPE_CHECKING
 from unittest import mock
@@ -57,6 +58,8 @@ from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS, AIRFLOW_V
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
+
+    from airflow.models import taskinstancekey
 
     from tests_common.pytest_plugin import DagMaker
 
@@ -309,21 +312,15 @@ class TestCeleryExecutor:
                 ti.try_number = 1
                 ti.queued_by_job_id = 1
                 session.flush()
-                key = TaskInstanceKey(
-                    ti.dag_id,
-                    ti.task_id,
-                    ti.run_id,
-                    ti.try_number,
-                    ti.map_index,
-                )
+                key: taskinstancekey.TaskInstanceKey = ti.key
                 workload = workloads.ExecuteTask(
                     ti=TaskInstanceDTO.model_validate(ti, from_attributes=True),
-                    dag_rel_path="test.py",
+                    dag_rel_path=PurePosixPath("test.py"),
                     token="",
                     bundle_info=BundleInfo(name="test"),
                     log_path="test.log",
                 )
-                executor.queue_workload(workload, session=None)
+                executor.queue_workload(workload=workload, session=session)
                 executor.trigger_workloads(open_slots=1)
 
                 async_result = None
