@@ -128,8 +128,6 @@ class TestClassifyPodFailure:
 
 
 class TestDisruptionTargetCondition:
-    """A control-plane disruption is only visible in the DisruptionTarget condition."""
-
     @pytest.mark.parametrize(
         "disruption_reason",
         [
@@ -161,7 +159,7 @@ class TestDisruptionTargetCondition:
         ("disruption_reason", "pod_name"),
         [("DeletionByTaintManager", "aip97-victim"), ("PreemptionByScheduler", "aip97-victim2")],
     )
-    def test_end_to_end_live_shape_is_infra(self, disruption_reason, pod_name):
+    def test_terminated_pod_keeps_disruption_reason(self, disruption_reason, pod_name):
         pod = k8s.V1Pod(
             metadata=k8s.V1ObjectMeta(name=pod_name, deletion_timestamp="2026-07-29T19:21:36Z"),
             status=k8s.V1PodStatus(

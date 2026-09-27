@@ -1693,7 +1693,7 @@ def test_worker_lost_is_reason_only_for_task_instances(state: str) -> None:
     executor.update_task_state(callback, state, callback_error)
 
     assert executor.fail.call_args_list == [
-        mock.call(lost, lost_error, reason="WorkerLost"),
+        mock.call(key=lost, info=lost_error, reason="WorkerLost"),
         mock.call(app_bug, app_error),
         mock.call(callback, callback_error),
     ]

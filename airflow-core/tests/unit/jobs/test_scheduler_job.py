@@ -578,12 +578,12 @@ class TestSchedulerJob:
         executor.fail(
             key=key,
             failure_kind=TaskFailureKind.INFRA,
-            reason="Evicted",
+            reason="PreemptionByScheduler",
         )
 
         runner._process_executor_events(executor=executor, session=settings.Session())
 
-        assert executor.task_failure_info == {}
+        assert executor.get_task_failure_info(key) is None
 
     @mock.patch("airflow.jobs.scheduler_job_runner.TaskCallbackRequest", spec=TaskCallbackRequest)
     def test_process_executor_events_restarting_cleared_task(self, mock_task_callback, dag_maker):
@@ -9592,13 +9592,18 @@ class TestSchedulerJob:
             (0, None, "failure", TaskInstanceState.FAILED),
             (
                 0,
-                (TaskFailureKind.INFRA, "Evicted"),
+                (TaskFailureKind.INFRA, "PreemptionByScheduler"),
+                "failure",
+                TaskInstanceState.FAILED,
+            ),
+            (
+                1,
+                (TaskFailureKind.INFRA, "PreemptionByScheduler"),
                 "retry",
                 TaskInstanceState.UP_FOR_RETRY,
             ),
         ],
     )
-    @conf_vars({("core", "max_infra_retries"): "1"})
     def test_external_kill_sets_callback_type_param(
         self,
         dag_maker,
@@ -9629,15 +9634,14 @@ class TestSchedulerJob:
         scheduler_job = Job()
         self.job_runner = SchedulerJobRunner(scheduler_job, executors=[executor])
 
-        ti.state = State.RUNNING
-        ti.try_number = 1
+        ti.state = State.RUNNING if failure_info is not None else State.QUEUED
+        if failure_info is not None:
+            ti.try_number = 1
         session.merge(ti)
         session.commit()
 
-        # The worker could not report its own failure.
-        executor.event_buffer[ti.key] = State.FAILED, None
-        if failure_info is not None:
-            executor.task_failure_info[ti.key] = failure_info
+        failure_kind, reason = failure_info or (None, None)
+        executor.fail(key=ti.key, failure_kind=failure_kind, reason=reason)
 
         self.job_runner._process_executor_events(executor=executor, session=session)
 
@@ -9645,7 +9649,7 @@ class TestSchedulerJob:
         request = self.job_runner.executor.callback_sink.send.call_args[0][0]
         assert isinstance(request, TaskCallbackRequest)
         assert request.task_callback_type == expected
-        assert request.context_from_server.max_tries == (1 if failure_info else retries)
+        assert request.context_from_server.max_tries == retries
         assert "failure_kind" not in type(request.context_from_server).model_fields
         assert "failure_reason" not in type(request.context_from_server).model_fields
 

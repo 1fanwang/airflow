@@ -75,7 +75,6 @@ from airflow._shared.observability.traces import (
     new_dagrun_trace_carrier,
     new_task_run_carrier,
 )
-from airflow._shared.state import TaskFailureKind
 from airflow._shared.timezones import timezone
 from airflow.assets.manager import asset_manager
 from airflow.configuration import conf
@@ -123,6 +122,7 @@ if TYPE_CHECKING:
     from sqlalchemy.sql import Update
     from sqlalchemy.sql.elements import ColumnElement
 
+    from airflow._shared.state import TaskFailureKind
     from airflow.api_fastapi.execution_api.datamodels.asset import AssetProfile
     from airflow.models.dag import DagModel
     from airflow.models.dagrun import DagRun
@@ -593,58 +593,6 @@ def _date_or_empty(*, task_instance: TaskInstance, attr: str) -> str:
     """
     result: datetime | None = getattr(task_instance, attr, None)
     return result.strftime("%Y%m%dT%H%M%S") if result else ""
-
-
-def _maybe_use_infra_retry(
-    *,
-    task_instance: TaskInstance,
-    task: Operator | None,
-    failure_kind: TaskFailureKind | None,
-    reason: str | None = None,
-) -> bool:
-    """Grant a replacement for a running failure within the deployment's inferred ceiling."""
-    if failure_kind != TaskFailureKind.INFRA or task is None:
-        return False
-
-    infra_retries = conf.getint("core", "max_infra_retries", fallback=0)
-    if infra_retries <= 0:
-        return False
-
-    if task_instance.state != TaskInstanceState.RUNNING:
-        return False
-    if task_instance.try_number < 1:
-        log.warning("Ignoring infrastructure retry for an unstarted task instance: %s", task_instance)
-        return False
-
-    inferred_position: int = max(
-        (task_instance.max_tries or 0) - (task.retries or 0),
-        task_instance.try_number - 1,
-        0,
-    )
-    if inferred_position >= infra_retries:
-        stats.incr("ti_infra_retry_denied", tags=task_instance.stats_tags)
-        log.info(
-            "Infrastructure retry refused by conservative ceiling for %s; "
-            "inferred_position=%s, cap=%s, prior_attempts=%s, reason=%s",
-            task_instance,
-            inferred_position,
-            infra_retries,
-            task_instance.try_number - 1,
-            reason,
-        )
-        return False
-
-    task_instance.max_tries = (task_instance.max_tries or 0) + 1
-    stats.incr("ti_infra_retry_granted", tags=task_instance.stats_tags)
-    log.info(
-        "Using infrastructure replacement at inferred position %s/%s for %s; reason=%s, max_tries=%s",
-        inferred_position + 1,
-        infra_retries,
-        task_instance,
-        reason,
-        task_instance.max_tries,
-    )
-    return True
 
 
 def uuid7() -> UUID:
@@ -1942,7 +1890,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         fail_fast: bool = False,
         failure_kind: TaskFailureKind | None = None,
         reason: str | None = None,
-    ):
+    ) -> TaskInstance:
         """
         Fetch the context needed to handle a failure.
 
@@ -1951,10 +1899,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         :param test_mode: doesn't record success or failure in the DB if True
         :param session: SQLAlchemy ORM Session
         :param fail_fast: if True, fail all downstream tasks
-        :param failure_kind: what caused the failure (:class:`TaskFailureKind` or
-            ``None``). ``INFRA`` is eligible for a deployment-controlled replacement.
-        :param reason: the producer's short failure reason, passed to listeners
-            without being persisted on the task instance.
+        :param failure_kind: Known failure category, or ``None`` when unknown
+        :param reason: Short producer-owned reason passed to listeners without being persisted
         """
         if error:
             cls.logger().error("%s", error)
@@ -1965,13 +1911,14 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         ti.set_duration()
 
         failure_tags: dict[str, str] = {
-            "failure_kind": failure_kind.value if failure_kind is not None else "unclassified"
+            **ti.stats_tags,
+            "failure_kind": failure_kind.value if failure_kind is not None else "unclassified",
         }
         stats.incr(
             "operator_failures",
-            tags={**ti.stats_tags, "operator_name": ti.operator, **failure_tags},
+            tags={**failure_tags, "operator_name": ti.operator},
         )
-        stats.incr("ti_failures", tags={**ti.stats_tags, **failure_tags})
+        stats.incr("ti_failures", tags=failure_tags)
 
         if not test_mode:
             session.add(Log(TaskInstanceState.FAILED.value, ti))
@@ -1988,13 +1935,6 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
 
         # Actual callbacks are handled by the DAG processor, not the scheduler
         task = getattr(ti, "task", None)
-
-        _maybe_use_infra_retry(
-            task_instance=ti,
-            task=task,
-            failure_kind=failure_kind,
-            reason=reason,
-        )
 
         if not ti.is_eligible_to_retry():
             ti.state = TaskInstanceState.FAILED
@@ -2051,10 +1991,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         :param error: if specified, log the specific exception if thrown
         :param test_mode: doesn't record success or failure in the DB if True
         :param session: SQLAlchemy ORM Session
-        :param failure_kind: what caused the failure (:class:`TaskFailureKind` or
-            ``None``), forwarded to the listener and the retry decision.
-        :param reason: the producer's short failure reason, passed to the listener
-            rather than persisted.
+        :param failure_kind: Known failure category forwarded to listeners and metrics
+        :param reason: Short producer-owned reason passed to listeners without being persisted
         """
         if TYPE_CHECKING:
             assert self.task
@@ -2086,9 +2024,15 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
             # If a task is cleared when running, it goes into RESTARTING state and is always
             # eligible for retry
             return True
-        # Mirror of the execution API's _is_eligible_to_retry; the scheduler and worker
-        # retry-decision paths must not diverge. See its comment for why retries is not consulted.
-        return bool(self.max_tries) and self.try_number <= self.max_tries
+        if not getattr(self, "task", None):
+            # Couldn't load the task, don't know number of retries, guess:
+            return self.try_number <= self.max_tries
+
+        if TYPE_CHECKING:
+            assert self.task
+            assert self.task.retries
+
+        return bool(self.task.retries and self.try_number <= self.max_tries)
 
     def set_duration(self) -> None:
         """Set task instance duration."""

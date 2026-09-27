@@ -106,20 +106,15 @@ of a :class:`~airflow.sdk.execution_time.task_runner.RuntimeTaskInstance` instan
 Failure cause
 """""""""""""
 
-``on_task_instance_failed`` can receive a :class:`~airflow_shared.state.TaskFailureKind`:
+``on_task_instance_failed`` can receive a :class:`~airflow.executors.base_executor.TaskFailureKind`:
 ``INFRA``, ``APPLICATION``, ``TIMEOUT``, or ``MANUAL``. The value is ``None`` when Airflow
 cannot establish the cause. The optional ``reason`` is a short producer-owned token such as
-``Evicted`` or ``WorkerLost``. A reason can be present without a failure kind.
+``PreemptionByScheduler`` or ``WorkerLost``. A reason can be present without a failure kind.
 
-.. code-block:: python
-
-    @hookimpl
-    def on_task_instance_failed(self, previous_state, task_instance, error, failure_kind, reason):
-        if failure_kind == "infra":
-            record_infrastructure_disruption(reason)
-
-The enum inherits from ``str`` and compares equal to its lower-case value. Existing listeners
-can omit both arguments because pluggy dispatches hook arguments by name.
+The enum inherits from ``str``, so ``failure_kind == "infra"`` identifies a confirmed
+infrastructure failure. Declare ``failure_kind`` and ``reason`` without defaults to receive
+them: pluggy dispatches only the required arguments declared by each listener.
+Existing listeners that omit these parameters continue to work.
 
 Asset Events
 --------------

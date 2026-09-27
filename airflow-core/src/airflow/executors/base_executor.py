@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 import pendulum
 
 from airflow._shared.observability.metrics import stats
+from airflow._shared.state import TaskFailureKind as TaskFailureKind  # noqa: TC001 - public re-export
 from airflow.cli.cli_config import DefaultHelpParser
 from airflow.configuration import conf
 from airflow.exceptions import RemovedInAirflow4Warning
@@ -75,7 +76,6 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
     from airflow._shared.logging.remote import StreamingLogResponse
-    from airflow._shared.state import TaskFailureKind
     from airflow.api_fastapi.auth.tokens import JWTGenerator
     from airflow.callbacks.base_callback_sink import BaseCallbackSink
     from airflow.callbacks.callback_requests import CallbackRequest
@@ -311,7 +311,7 @@ class BaseExecutor(LoggingMixin):
         )
         self.running: set[WorkloadKey] = set()
         self.event_buffer: dict[WorkloadKey, EventBufferValueType] = {}
-        self.task_failure_info: dict[WorkloadKey, tuple[TaskFailureKind | None, str | None]] = {}
+        self._task_failure_info: dict[WorkloadKey, tuple[TaskFailureKind | None, str | None]] = {}
         self._task_event_logs: deque[Log] = deque()
         self.conf = ExecutorConf(team_name)
 
@@ -573,7 +573,9 @@ class BaseExecutor(LoggingMixin):
     # TODO: This should not be using `TaskInstanceState` here, this is just "did the process complete, or did
     # it die". It is possible for the task itself to finish with success, but the state of the task to be set
     # to FAILED. By using TaskInstanceState enum here it confuses matters!
-    def change_state(self, key: WorkloadKey, state: WorkloadState, info=None, remove_running=True) -> None:
+    def change_state(
+        self, key: WorkloadKey, state: WorkloadState, info: Any = None, remove_running: bool = True
+    ) -> None:
         """
         Change state of the task.
 
@@ -588,6 +590,7 @@ class BaseExecutor(LoggingMixin):
                 self.running.remove(key)
             except KeyError:
                 self.log.debug("Could not find key: %s", key)
+        self._task_failure_info.pop(key, None)
         self.event_buffer[key] = state, info
 
     def fail(
@@ -606,9 +609,9 @@ class BaseExecutor(LoggingMixin):
         :param failure_kind: Cause of the failure, when the executor can identify it
         :param reason: Short executor-owned reason token, with or without a failure kind
         """
+        self.change_state(key=key, state=state_class_for_key(key).FAILED, info=info)
         if failure_kind is not None or reason is not None:
-            self.task_failure_info[key] = failure_kind, reason
-        self.change_state(key, state_class_for_key(key).FAILED, info)
+            self._task_failure_info[key] = failure_kind, reason
 
     def success(self, key: WorkloadKey, info=None) -> None:
         """
@@ -661,7 +664,7 @@ class BaseExecutor(LoggingMixin):
 
     def get_task_failure_info(self, key: WorkloadKey) -> tuple[TaskFailureKind | None, str | None] | None:
         """Return and clear the failure cause reported for ``key``."""
-        return self.task_failure_info.pop(key, None)
+        return self._task_failure_info.pop(key, None)
 
     def get_task_log(self, ti: TaskInstance, try_number: int) -> tuple[list[str], list[str]]:
         """

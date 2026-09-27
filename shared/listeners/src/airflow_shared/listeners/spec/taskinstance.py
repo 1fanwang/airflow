@@ -55,16 +55,8 @@ def on_task_instance_failed(
     error: None | str | BaseException,
     failure_kind: TaskFailureKind | None,
     reason: str | None,
-):
-    """
-    Execute when a task instance fails.
-
-    :param previous_state: Previous state of the task instance (can be None)
-    :param task_instance: The task instance object
-    :param error: The exception or message associated with the failure
-    :param failure_kind: Classified cause, or ``None`` when Airflow cannot establish one
-    :param reason: Short producer-owned reason token, which may be present without a kind
-    """
+) -> None:
+    """Handle a failed attempt with its known cause, including when the task will retry."""
 
 
 @hookspec

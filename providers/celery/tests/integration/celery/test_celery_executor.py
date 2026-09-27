@@ -52,7 +52,6 @@ from airflow.sdk import BaseOperator
 from airflow.utils.state import State, TaskInstanceState
 
 from tests_common.test_utils import db
-from tests_common.test_utils.config import conf_vars
 from tests_common.test_utils.taskinstance import create_task_instance
 from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS, AIRFLOW_V_3_4_PLUS
 
@@ -274,9 +273,8 @@ class TestCeleryExecutor:
     @pytest.mark.skipif(not AIRFLOW_V_3_4_PLUS, reason="Executor failure reasons require Airflow 3.4+")
     @pytest.mark.parametrize("broker_url", _prepare_test_bodies())
     @pytest.mark.parametrize("retries", [0, 1])
-    @pytest.mark.parametrize("cap", [0, 1])
     def test_worker_lost_is_reason_only(
-        self, broker_url: str, retries: int, cap: int, dag_maker: DagMaker, session: Session
+        self, broker_url: str, retries: int, dag_maker: DagMaker, session: Session
     ) -> None:
         """Use real prefork loss, but stub task execution and seed a queued TI."""
         from airflow._shared.observability.metrics import stats
@@ -288,10 +286,7 @@ class TestCeleryExecutor:
         def fake_execute(_input: str) -> None:
             sleep(60)
 
-        with (
-            conf_vars({("core", "max_infra_retries"): str(cap)}),
-            _prepare_app(broker_url, execute=fake_execute) as app,
-        ):
+        with _prepare_app(broker_url, execute=fake_execute) as app:
             executor = celery_executor.CeleryExecutor()
             executor._sync_parallelism = 1
             executor.start()
@@ -329,7 +324,7 @@ class TestCeleryExecutor:
                     log_path="test.log",
                 )
                 executor.queue_workload(workload, session=None)
-                executor.trigger_tasks(open_slots=1)
+                executor.trigger_workloads(open_slots=1)
 
                 async_result = None
                 for _ in range(150):
@@ -350,7 +345,7 @@ class TestCeleryExecutor:
                     sleep(0.2)
 
                 assert executor.event_buffer[key][0] == State.FAILED
-                assert executor.task_failure_info[key] == (None, "WorkerLost")
+                assert executor._task_failure_info[key] == (None, "WorkerLost")
 
                 runner = SchedulerJobRunner(job=Job(), executors=[executor])
                 with mock.patch("airflow.models.taskinstance.stats.incr", wraps=stats.incr) as mock_incr:
@@ -364,10 +359,7 @@ class TestCeleryExecutor:
 
                 expected_state = TaskInstanceState.UP_FOR_RETRY if retries else TaskInstanceState.FAILED
                 assert (ti.state, ti.max_tries) == (expected_state, retries)
-                assert key not in executor.task_failure_info
-                assert {call.args[0] for call in mock_incr.call_args_list}.isdisjoint(
-                    {"ti_infra_retry_granted", "ti_infra_retry_denied"}
-                )
+                assert executor.get_task_failure_info(key) is None
                 mock_incr.assert_any_call(
                     "ti_failures", tags={**ti.stats_tags, "failure_kind": "unclassified"}
                 )

@@ -1418,7 +1418,7 @@ def test_run_raises_system_exit(time_machine, create_runtime_ti, mock_supervisor
     mock_supervisor_comms.send.assert_called_with(TaskState(state=TaskInstanceState.FAILED, end_date=instant))
 
     log.exception.assert_not_called()
-    log.error.assert_called_with(mock.ANY, exit_code=10)
+    log.error.assert_called_with(mock.ANY, exit_code=10, failure_kind=TaskFailureKind.APPLICATION)
 
 
 def test_run_raises_airflow_exception(time_machine, create_runtime_ti, mock_supervisor_comms):
@@ -4812,14 +4812,19 @@ class TestTaskRunnerCallsListeners:
     @pytest.mark.parametrize(
         "state", [TaskInstanceState.FAILED, TaskInstanceState.UP_FOR_RETRY], ids=["failed", "up_for_retry"]
     )
+    @pytest.mark.parametrize(
+        ("error", "expected_kind"),
+        [
+            (RuntimeError("boom"), TaskFailureKind.APPLICATION),
+            (AirflowTaskTimeout("timeout"), TaskFailureKind.TIMEOUT),
+            (AirflowTaskTerminated("terminated"), None),
+            (None, None),
+        ],
+    )
     def test_listener_declaring_reason_still_fires(
-        self, state, mocked_parse, mock_supervisor_comms, listener_manager
+        self, state, error, expected_kind, mocked_parse, mock_supervisor_comms, listener_manager
     ):
-        """A hookimpl using the full signature the hookspec documents must still be called.
-
-        pluggy raises HookCallError when a hookspec argument is missing from the call, and
-        finalize() swallows it, so omitting one here silently stops the listener firing.
-        """
+        """Pluggy rejects missing hook arguments, so both cause fields must be supplied."""
         received = {}
 
         class FullSignatureListener:
@@ -4843,9 +4848,15 @@ class TestTaskRunnerCallsListeners:
         runtime_ti = RuntimeTaskInstance.model_construct(
             **ti.model_dump(exclude_unset=True), task=task, start_date=timezone.utcnow()
         )
-        finalize(runtime_ti, state, runtime_ti.get_template_context(), mock.MagicMock(), RuntimeError("boom"))
+        finalize(
+            ti=runtime_ti,
+            state=state,
+            context=runtime_ti.get_template_context(),
+            log=mock.MagicMock(spec=structlog.stdlib.BoundLogger),
+            error=error,
+        )
 
-        assert received == {"failure_kind": TaskFailureKind.APPLICATION, "reason": None}
+        assert received == {"failure_kind": expected_kind, "reason": None}
 
     def test_task_runner_calls_listeners_failed_when_terminal_send_fails(
         self, mocked_parse, mock_supervisor_comms, listener_manager
@@ -5314,7 +5325,7 @@ class TestTaskRunnerCallsCallbacks:
                 False,
                 TaskInstanceState.FAILED,
                 ["on-execute 1", "on-execute 3", "execute failure", "on-failure 1", "on-failure 3"],
-                [(1, mock.call("Task failed with exception"))],
+                [(1, mock.call("Task failed with exception", failure_kind=TaskFailureKind.APPLICATION))],
                 id="failure",
             ),
             pytest.param(
@@ -5323,7 +5334,7 @@ class TestTaskRunnerCallsCallbacks:
                 True,
                 TaskInstanceState.UP_FOR_RETRY,
                 ["on-execute 1", "on-execute 3", "execute failure", "on-retry 1", "on-retry 3"],
-                [(1, mock.call("Task failed with exception"))],
+                [(1, mock.call("Task failed with exception", failure_kind=TaskFailureKind.APPLICATION))],
                 id="retry",
             ),
         ],

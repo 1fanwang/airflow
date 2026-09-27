@@ -55,7 +55,7 @@ if AIRFLOW_V_3_4_PLUS:
 
 log = logging.getLogger(__name__)
 
-WORKER_LOST_REASON = "WorkerLost"
+WORKER_LOST_REASON: str = "WorkerLost"
 
 
 CELERY_SEND_ERR_MSG_HEADER = "Error sending Celery workload"
@@ -311,7 +311,7 @@ class CeleryExecutor(BaseExecutor):
                     from airflow.models.taskinstancekey import TaskInstanceKey
 
                     if isinstance(key, TaskInstanceKey):
-                        self.fail(key, info, reason=WORKER_LOST_REASON)
+                        self.fail(key=key, info=info, reason=WORKER_LOST_REASON)
                         return
                 self.fail(key, info)
             elif state in (celery_states.STARTED, celery_states.PENDING, celery_states.RETRY):
