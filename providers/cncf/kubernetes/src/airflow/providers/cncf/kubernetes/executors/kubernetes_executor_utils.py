@@ -54,11 +54,15 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.state import TaskInstanceState
 
 if TYPE_CHECKING:
+    import logging
     from collections.abc import Iterator
 
     from kubernetes.client import Configuration, models as k8s
+    from structlog.typing import FilteringBoundLogger
 
-    from airflow._shared.state import TaskFailureKind
+if AIRFLOW_V_3_4_PLUS or TYPE_CHECKING:
+    # Older supported Airflow versions lack this enum.
+    from airflow.executors.base_executor import TaskFailureKind
 
 
 class ResourceVersion:
@@ -364,13 +368,8 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
             )
 
 
-def _disruption_target_reason(pod_status: k8s.V1PodStatus) -> str | None:
-    """
-    Return the ``DisruptionTarget`` condition's reason, which outlives the pod's phase.
-
-    Gated on status "True" like Kubernetes' own podFailurePolicy matcher, since the writers
-    update the condition in place and a stale reason can survive a flip to "False".
-    """
+def _get_disruption_target_reason(pod_status: k8s.V1PodStatus) -> str | None:
+    """Read a current disruption reason; a false condition can retain a stale reason."""
     for condition in getattr(pod_status, "conditions", None) or []:
         if (
             getattr(condition, "type", None) == "DisruptionTarget"
@@ -380,13 +379,15 @@ def _disruption_target_reason(pod_status: k8s.V1PodStatus) -> str | None:
     return None
 
 
-def collect_pod_failure_details(pod: k8s.V1Pod, logger) -> FailureDetails | None:
+def collect_pod_failure_details(
+    pod: k8s.V1Pod, logger: logging.Logger | FilteringBoundLogger
+) -> FailureDetails | None:
     """Collect failure details, including disruption conditions reported before termination."""
     if not pod.status:
         return None
 
     try:
-        disruption_reason: str | None = _disruption_target_reason(pod.status)
+        disruption_reason: str | None = _get_disruption_target_reason(pod.status)
         if pod.status.phase != "Failed" and disruption_reason is None:
             return None
 
@@ -460,8 +461,6 @@ def classify_pod_failure(
     """Return the pod's trusted failure kind and short reason, when available."""
     if not failure_details or not AIRFLOW_V_3_4_PLUS:
         return None
-
-    from airflow._shared.state import TaskFailureKind
 
     pod_reason = failure_details.get("pod_reason")
     container_reason = failure_details.get("container_reason")

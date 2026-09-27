@@ -2356,7 +2356,9 @@ class TestTaskInstance:
         assert ti_list[3].get_previous_ti(state=State.SUCCESS).run_id != ti_list[2].run_id
 
     @provide_session
-    def test_handle_failure_calls_listener(self, dag_maker, *, session: Session):
+    def test_handle_failure_calls_listener(
+        self, dag_maker, monkeypatch: pytest.MonkeyPatch, *, session: Session
+    ) -> None:
         class CustomOp(BaseOperator):
             def execute(self, context): ...
 
@@ -2366,7 +2368,11 @@ class TestTaskInstance:
         from airflow.listeners.listener import get_listener_manager
 
         listener_callback_on_error = mock.MagicMock()
-        get_listener_manager().pm.hook.on_task_instance_failed = listener_callback_on_error
+        monkeypatch.setattr(
+            target=get_listener_manager().pm.hook,
+            name="on_task_instance_failed",
+            value=listener_callback_on_error,
+        )
 
         with dag_maker(dag_id="test_handle_failure", start_date=start_date, schedule=None) as dag:
             task1 = CustomOp(
@@ -2456,8 +2462,9 @@ class TestTaskInstance:
             "operator_failures", tags={**expected_stats_tags, "operator_name": "EmptyOperator"}
         )
 
+    @pytest.mark.parametrize("failure_kind", [None, *TaskFailureKind])
     @patch("airflow._shared.observability.metrics.stats._get_backend")
-    def test_handle_failure_tags_classified_cause(self, mock_get_backend, dag_maker):
+    def test_handle_failure_tags_classified_cause(self, mock_get_backend, failure_kind, dag_maker):
         backend = mock.MagicMock(spec=StatsLogger)
         mock_get_backend.return_value = backend
         session = settings.Session()
@@ -2472,13 +2479,12 @@ class TestTaskInstance:
             "dag_id": ti.dag_id,
             "task_id": ti.task_id,
             "run_type": dr.run_type,
-            "failure_kind": TaskFailureKind.INFRA.value,
+            "failure_kind": failure_kind.value if failure_kind is not None else "unclassified",
         }
 
         ti.handle_failure(
-            "infra kill",
-            failure_kind=TaskFailureKind.INFRA,
-            reason="Evicted",
+            error="task failed",
+            failure_kind=failure_kind,
             session=session,
         )
 
