@@ -1988,14 +1988,14 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         # Actual callbacks are handled by the DAG processor, not the scheduler
         task = getattr(ti, "task", None)
 
-        _maybe_use_infra_retry(
+        infra_retry_granted: bool = _maybe_use_infra_retry(
             task_instance=ti,
             task=task,
             failure_kind=failure_kind,
             reason=reason,
         )
 
-        if not ti.is_eligible_to_retry():
+        if not infra_retry_granted and not ti.is_eligible_to_retry():
             ti.state = TaskInstanceState.FAILED
 
             if task and fail_fast:
@@ -2083,8 +2083,15 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
             # If a task is cleared when running, it goes into RESTARTING state and is always
             # eligible for retry
             return True
-        # Match the execution API's eligibility check, including replacements for retries=0.
-        return bool(self.max_tries) and self.try_number <= self.max_tries
+        if not getattr(self, "task", None):
+            # Couldn't load the task, don't know number of retries, guess:
+            return self.try_number <= self.max_tries
+
+        if TYPE_CHECKING:
+            assert self.task
+            assert self.task.retries
+
+        return bool(self.task.retries and self.try_number <= self.max_tries)
 
     def set_duration(self) -> None:
         """Set task instance duration."""

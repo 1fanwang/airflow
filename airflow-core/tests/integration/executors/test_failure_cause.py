@@ -52,7 +52,10 @@ pytestmark = pytest.mark.db_test
     ("cap", "retries", "max_tries", "try_number", "expected_state", "expected_max_tries"),
     [
         (0, 0, 0, 1, TaskInstanceState.FAILED, 0),
+        (0, 0, 3, 1, TaskInstanceState.FAILED, 3),
+        (1, 0, 3, 1, TaskInstanceState.FAILED, 3),
         (1, 0, 0, 1, TaskInstanceState.UP_FOR_RETRY, 1),
+        (3, 0, 0, 2, TaskInstanceState.UP_FOR_RETRY, 1),
         (1, 0, 1, 2, TaskInstanceState.FAILED, 1),
         (1, 2, 2, 2, TaskInstanceState.UP_FOR_RETRY, 2),
     ],

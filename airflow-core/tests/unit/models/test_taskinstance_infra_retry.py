@@ -188,21 +188,3 @@ def test_clear_cannot_reopen_prior_attempt_ceiling(dag_maker: DagMaker, session:
     assert ti.max_tries == 5
     assert not _maybe_use_infra_retry(task_instance=ti, task=ti.task, failure_kind=TaskFailureKind.INFRA)
     assert ti.max_tries == 5
-
-
-@pytest.mark.parametrize(("max_tries", "try_number", "expected"), [(1, 1, True), (2, 2, True), (2, 3, False)])
-def test_zero_retries_uses_effective_max_tries(
-    max_tries: int, try_number: int, expected: bool, dag_maker: DagMaker, session: Session
-) -> None:
-    with dag_maker(dag_id="infra_retry_eligibility"):
-        task = EmptyOperator(task_id="task", retries=0)
-    ti: TaskInstance | None = dag_maker.create_dagrun().get_task_instance(
-        task_id=task.task_id, session=session
-    )
-    assert ti is not None
-    ti.task = dag_maker.serialized_dag.get_task(task.task_id)
-    ti.state = TaskInstanceState.RUNNING
-    ti.max_tries = max_tries
-    ti.try_number = try_number
-
-    assert ti.is_eligible_to_retry() is expected
