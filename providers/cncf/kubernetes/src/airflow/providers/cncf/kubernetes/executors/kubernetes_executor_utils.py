@@ -54,11 +54,15 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.state import TaskInstanceState
 
 if TYPE_CHECKING:
+    import logging
     from collections.abc import Iterator
 
     from kubernetes.client import Configuration, models as k8s
+    from structlog.typing import FilteringBoundLogger
 
-    from airflow._shared.state import TaskFailureKind
+if AIRFLOW_V_3_4_PLUS or TYPE_CHECKING:
+    # Older supported Airflow versions lack this enum.
+    from airflow.executors.base_executor import TaskFailureKind
 
 
 class ResourceVersion:
@@ -347,7 +351,7 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
                         state=TaskInstanceState.FAILED,
                         annotations=annotations,
                         resource_version=resource_version,
-                        failure_details=None,
+                        failure_details=collect_pod_failure_details(pod=pod, logger=self.log),
                     )
                 )
             else:
@@ -364,13 +368,8 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
             )
 
 
-def _disruption_target_reason(pod_status: k8s.V1PodStatus) -> str | None:
-    """
-    Return the ``DisruptionTarget`` condition's reason, which outlives the pod's phase.
-
-    Gated on status "True" like Kubernetes' own podFailurePolicy matcher, since the writers
-    update the condition in place and a stale reason can survive a flip to "False".
-    """
+def _get_disruption_target_reason(pod_status: k8s.V1PodStatus) -> str | None:
+    """Read a current disruption reason; a false condition can retain a stale reason."""
     for condition in getattr(pod_status, "conditions", None) or []:
         if (
             getattr(condition, "type", None) == "DisruptionTarget"
@@ -380,31 +379,27 @@ def _disruption_target_reason(pod_status: k8s.V1PodStatus) -> str | None:
     return None
 
 
-def collect_pod_failure_details(pod: k8s.V1Pod, logger) -> FailureDetails | None:
-    """
-    Collect detailed failure information from a failed pod.
-
-    Analyzes both init containers and main containers to determine the root cause
-    of pod failure, prioritizing terminated containers with non-zero exit codes.
-
-    Args:
-        pod: The Kubernetes V1Pod object to analyze
-        logger: Logger instance to use for error logging
-
-    Returns:
-        FailureDetails dict with failure information, or None if no failure details found
-    """
-    if not pod.status or pod.status.phase != "Failed":
+def collect_pod_failure_details(
+    pod: k8s.V1Pod, logger: logging.Logger | FilteringBoundLogger
+) -> FailureDetails | None:
+    """Collect failure details, including disruption conditions reported before termination."""
+    if not pod.status:
         return None
 
     try:
+        disruption_reason: str | None = _get_disruption_target_reason(pod.status)
+        if pod.status.phase != "Failed" and disruption_reason is None:
+            return None
+
         # Basic pod-level information
         failure_details: FailureDetails = {
             "pod_status": getattr(pod.status, "phase", None),
             "pod_reason": getattr(pod.status, "reason", None),
             "pod_message": getattr(pod.status, "message", None),
-            "disruption_reason": _disruption_target_reason(pod.status),
+            "disruption_reason": disruption_reason,
         }
+        if pod.status.phase != "Failed":
+            return failure_details
 
         # Check init containers first (they run before main containers)
         container_failure = _analyze_init_containers(pod.status)
@@ -434,13 +429,11 @@ def collect_pod_failure_details(pod: k8s.V1Pod, logger) -> FailureDetails | None
 
 
 # The Python client exposes the fields, but not Kubernetes' reason constants:
-# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/eviction/helpers.go#L42-L44
 # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/preemption/preemption.go#L112-L117
 # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/nodeshutdown/nodeshutdown_manager.go#L88-L89
 # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/util/node/node.go#L28-L31
 _INFRA_FAILURE_REASONS: frozenset[str] = frozenset(
     {
-        "Evicted",
         "Preempting",
         "Terminated",
         "NodeLost",
@@ -469,8 +462,6 @@ def classify_pod_failure(
     if not failure_details or not AIRFLOW_V_3_4_PLUS:
         return None
 
-    from airflow._shared.state import TaskFailureKind
-
     pod_reason = failure_details.get("pod_reason")
     container_reason = failure_details.get("container_reason")
     disruption_reason = failure_details.get("disruption_reason")
@@ -478,8 +469,10 @@ def classify_pod_failure(
     reason = disruption_reason or pod_reason or container_reason
     if reason is None:
         return None
-    if disruption_reason in _DISRUPTION_TARGET_REASONS or reason in _INFRA_FAILURE_REASONS:
-        return TaskFailureKind.INFRA, reason
+    if disruption_reason in _DISRUPTION_TARGET_REASONS:
+        return TaskFailureKind.INFRA, disruption_reason
+    if pod_reason in _INFRA_FAILURE_REASONS:
+        return TaskFailureKind.INFRA, pod_reason
     return None, reason
 
 

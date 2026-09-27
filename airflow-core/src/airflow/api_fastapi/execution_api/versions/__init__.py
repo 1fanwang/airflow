@@ -44,6 +44,7 @@ from airflow.api_fastapi.execution_api.versions.v2026_06_30 import (
     AddAssetsByAliasEndpoint,
     AddAwaitingInputStatePayload,
     AddConnectionTestEndpoint,
+    AddConsumedAssetEventPartitionKeyField,
     AddPartitionDateField,
     AddRetryPolicyFields,
     AddTaskAndAssetStateStoreEndpoints,
@@ -54,13 +55,17 @@ from airflow.api_fastapi.execution_api.versions.v2026_06_30 import (
 from airflow.api_fastapi.execution_api.versions.v2026_10_30 import (
     AddArgBindingsToTIRunContext,
     AddCallbackRunEndpoint,
+    AddMultiTeamToTIRunContext,
 )
-from airflow.api_fastapi.execution_api.versions.v2026_11_30 import AddFailureCauseToTIRunContext
 
 bundle = VersionBundle(
     HeadVersion(),
-    Version("2026-11-30", AddFailureCauseToTIRunContext),
-    Version("2026-10-30", AddArgBindingsToTIRunContext, AddCallbackRunEndpoint),
+    Version(
+        "2026-10-30",
+        AddArgBindingsToTIRunContext,
+        AddCallbackRunEndpoint,
+        AddMultiTeamToTIRunContext,
+    ),
     Version(
         "2026-06-30",
         AddVariableKeysEndpoint,
@@ -72,6 +77,7 @@ bundle = VersionBundle(
         AddTaskAndAssetStateStoreEndpoints,
         AddAssetsByAliasEndpoint,
         AddPartitionDateField,
+        AddConsumedAssetEventPartitionKeyField,
     ),
     Version(
         "2026-04-06",

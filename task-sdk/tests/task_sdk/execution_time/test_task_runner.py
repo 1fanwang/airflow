@@ -1271,6 +1271,42 @@ def test_run_emits_post_execute_group_before_xcom_push(create_runtime_ti, mock_s
     assert call_order.index("::group::Post Execute") < call_order.index("Pushing xcom")
 
 
+def test_retry_policy_decision_logged_outside_post_execute_group(create_runtime_ti, mock_supervisor_comms):
+    """The retry policy decision log line closes the 'Post Execute' group instead of nesting inside it."""
+    call_order: list[str] = []
+    tracked = {"::group::Post Execute", "::endgroup::", "Retry policy decision"}
+
+    class _FailPolicy(RetryPolicy):
+        def evaluate(self, exception, try_number, max_tries, context=None):
+            return RetryDecision(action=RetryAction.FAIL, reason="auth error, do not retry")
+
+    class _AlwaysFails(BaseOperator):
+        def execute(self, context):
+            raise RuntimeError("boom")
+
+    task = _AlwaysFails(task_id="fail_policy_task", retry_policy=_FailPolicy())
+    ti = create_runtime_ti(task=task, should_retry=True)
+    log = mock.MagicMock(spec=["info", "debug", "warning", "error", "exception", "bind"])
+
+    def tracking_info(msg, *args, **kwargs):
+        if msg in tracked:
+            call_order.append(msg)
+
+    log.info.side_effect = tracking_info
+
+    state, msg, error = run(ti, context=ti.get_template_context(), log=log)
+    finalize(ti, state=state, context=ti.get_template_context(), log=log)
+
+    # No reopened "Post Execute", only finalize() ::endgroup:: follows the retry policy decision.
+    assert call_order == [
+        "::endgroup::",
+        "::group::Post Execute",
+        "::endgroup::",
+        "Retry policy decision",
+        "::endgroup::",
+    ]
+
+
 def test_finalize_emits_endgroup(create_runtime_ti, mock_supervisor_comms):
     """finalize() closes the post-execute log group but does not open it."""
     task = BaseOperator(task_id="some_task")
@@ -1382,7 +1418,7 @@ def test_run_raises_system_exit(time_machine, create_runtime_ti, mock_supervisor
     mock_supervisor_comms.send.assert_called_with(TaskState(state=TaskInstanceState.FAILED, end_date=instant))
 
     log.exception.assert_not_called()
-    log.error.assert_called_with(mock.ANY, exit_code=10)
+    log.error.assert_called_with(mock.ANY, exit_code=10, failure_kind=TaskFailureKind.APPLICATION)
 
 
 def test_run_raises_airflow_exception(time_machine, create_runtime_ti, mock_supervisor_comms):
@@ -2236,16 +2272,47 @@ class TestRuntimeTaskInstance:
             "ti": runtime_ti,
         }
 
-    def test_failure_context_from_server(self, create_runtime_ti):
+    def test_macros_in_context_are_scoped_to_the_tasks_team(self, create_runtime_ti, mock_supervisor_comms):
+        """The accessor placed in the context must carry the team the server reported."""
+        from airflow.sdk.plugins_manager import AirflowPlugin
+
+        from tests_common.test_utils.mock_plugins import mock_plugin_manager
+
+        def team_a_macro():
+            return "team-a"
+
+        class TeamAPlugin(AirflowPlugin):
+            name = "team_a_macros"
+            team_name = "team-a"
+            macros = [team_a_macro]
+
+        runtime_ti = create_runtime_ti(task=BaseOperator(task_id="hello"), dag_id="basic_task")
+        # Stand in for a multi-team server handing this task to a worker as team-b's.
+        runtime_ti._ti_context_from_server.multi_team = True
+        runtime_ti._ti_context_from_server.dag_run.team_name = "team-b"
+
+        dr = runtime_ti._ti_context_from_server.dag_run
+        mock_supervisor_comms.send.return_value = PrevSuccessfulDagRunResult(
+            data_interval_end=dr.logical_date - timedelta(hours=1),
+            data_interval_start=dr.logical_date - timedelta(hours=2),
+            start_date=dr.start_date - timedelta(hours=1),
+            end_date=dr.start_date,
+        )
+
+        with mock_plugin_manager(plugins=[TeamAPlugin]):
+            macros = runtime_ti.get_template_context()["macros"]
+
+            with pytest.raises(AttributeError, match="belong to team 'team-a'"):
+                macros.team_a_macros
+
+    def test_failure_cause_is_not_added_to_template_context(self, create_runtime_ti):
         task = BaseOperator(task_id="failure_context")
         runtime_ti = create_runtime_ti(task=task, dag_id="failure_context")
-        runtime_ti._ti_context_from_server.failure_kind = TaskFailureKind.INFRA.value
-        runtime_ti._ti_context_from_server.failure_reason = "Evicted"
 
         context = runtime_ti.get_template_context()
 
-        assert context["failure_kind"] == TaskFailureKind.INFRA.value
-        assert context["failure_reason"] == "Evicted"
+        assert "failure_kind" not in context
+        assert "failure_reason" not in context
 
     def test_get_context_with_ti_context_from_server(self, create_runtime_ti, mock_supervisor_comms):
         """Test the context keys are added when sent from API server (mocked)"""
@@ -2276,8 +2343,6 @@ class TestRuntimeTaskInstance:
             },
             "conn": ConnectionAccessor(),
             "dag": runtime_ti.task.dag,
-            "failure_kind": None,
-            "failure_reason": None,
             "inlets": task.inlets,
             "inlet_events": InletEventsAccessors(inlets=[]),
             "macros": MacrosAccessor(),
@@ -4747,14 +4812,19 @@ class TestTaskRunnerCallsListeners:
     @pytest.mark.parametrize(
         "state", [TaskInstanceState.FAILED, TaskInstanceState.UP_FOR_RETRY], ids=["failed", "up_for_retry"]
     )
+    @pytest.mark.parametrize(
+        ("error", "expected_kind"),
+        [
+            (RuntimeError("boom"), TaskFailureKind.APPLICATION),
+            (AirflowTaskTimeout("timeout"), TaskFailureKind.TIMEOUT),
+            (AirflowTaskTerminated("terminated"), None),
+            (None, None),
+        ],
+    )
     def test_listener_declaring_reason_still_fires(
-        self, state, mocked_parse, mock_supervisor_comms, listener_manager
+        self, state, error, expected_kind, mocked_parse, mock_supervisor_comms, listener_manager
     ):
-        """A hookimpl using the full signature the hookspec documents must still be called.
-
-        pluggy raises HookCallError when a hookspec argument is missing from the call, and
-        finalize() swallows it, so omitting one here silently stops the listener firing.
-        """
+        """Pluggy rejects missing hook arguments, so both cause fields must be supplied."""
         received = {}
 
         class FullSignatureListener:
@@ -4778,9 +4848,15 @@ class TestTaskRunnerCallsListeners:
         runtime_ti = RuntimeTaskInstance.model_construct(
             **ti.model_dump(exclude_unset=True), task=task, start_date=timezone.utcnow()
         )
-        finalize(runtime_ti, state, runtime_ti.get_template_context(), mock.MagicMock(), RuntimeError("boom"))
+        finalize(
+            ti=runtime_ti,
+            state=state,
+            context=runtime_ti.get_template_context(),
+            log=mock.MagicMock(spec=structlog.stdlib.BoundLogger),
+            error=error,
+        )
 
-        assert received == {"failure_kind": TaskFailureKind.APPLICATION, "reason": None}
+        assert received == {"failure_kind": expected_kind, "reason": None}
 
     def test_task_runner_calls_listeners_failed_when_terminal_send_fails(
         self, mocked_parse, mock_supervisor_comms, listener_manager
@@ -5249,7 +5325,7 @@ class TestTaskRunnerCallsCallbacks:
                 False,
                 TaskInstanceState.FAILED,
                 ["on-execute 1", "on-execute 3", "execute failure", "on-failure 1", "on-failure 3"],
-                [(1, mock.call("Task failed with exception"))],
+                [(1, mock.call("Task failed with exception", failure_kind=TaskFailureKind.APPLICATION))],
                 id="failure",
             ),
             pytest.param(
@@ -5258,7 +5334,7 @@ class TestTaskRunnerCallsCallbacks:
                 True,
                 TaskInstanceState.UP_FOR_RETRY,
                 ["on-execute 1", "on-execute 3", "execute failure", "on-retry 1", "on-retry 3"],
-                [(1, mock.call("Task failed with exception"))],
+                [(1, mock.call("Task failed with exception", failure_kind=TaskFailureKind.APPLICATION))],
                 id="retry",
             ),
         ],
@@ -5942,6 +6018,23 @@ class TestTaskInstanceMetrics:
                 tags={**stats_tags, "operator_name": "PythonOperator"},
             )
             backend.incr.assert_any_call("ti_successes", tags=stats_tags)
+
+    @pytest.mark.parametrize("failure_kind", [None, *TaskFailureKind])
+    @mock.patch("airflow.sdk._shared.observability.metrics.stats._get_backend")
+    def test_failure_metric_kind_is_bounded(self, mock_get_backend, failure_kind, create_runtime_ti):
+        task = PythonOperator(task_id="test", python_callable=lambda: None)
+        ti = create_runtime_ti(task=task)
+        backend = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = backend
+
+        task_runner._finalize_task_failure(ti=ti, failure_kind=failure_kind)
+
+        tags = {
+            **ti.stats_tags,
+            "failure_kind": failure_kind.value if failure_kind is not None else "unclassified",
+        }
+        backend.incr.assert_any_call("ti_failures", tags=tags)
+        backend.incr.assert_any_call("operator_failures", tags={**tags, "operator_name": "PythonOperator"})
 
     def test_operator_failures_metrics_emitted(self, create_runtime_ti, mock_supervisor_comms):
         """Test that operator_failures and ti_failures metrics are emitted on task failure."""

@@ -16,15 +16,17 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import type { RefObject } from "react";
+import { useCallback, useMemo, useRef } from "react";
+
 import { Box, Flex } from "@chakra-ui/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import dayjs from "dayjs";
 import dayjsDuration from "dayjs/plugin/duration";
-import type { RefObject } from "react";
-import { useCallback, useMemo, useRef } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 
 import type { DagRunState, DagRunType, GridRunsResponse } from "openapi/requests";
+
 import type { VersionIndicatorOptions } from "src/constants/showVersionIndicatorOptions";
 import { useGroups } from "src/context/groups";
 import { NavigationModes, useNavigation } from "src/hooks/navigation";
@@ -62,7 +64,10 @@ type Props = {
 };
 
 const GRID_INNER_SCROLL_PADDING_START_PX = GRID_HEADER_PADDING_PX + GRID_HEADER_HEIGHT_PX;
-const ScrollbarSpacer = () => <Box aria-hidden flexShrink={0} minWidth="16px" width="16px" />;
+// Reserves right-edge space for the scrollbar, and widens to fit the newer/reset pager buttons when shown.
+const ScrollbarSpacer = ({ width = "16px" }: { readonly width?: string }) => (
+  <Box aria-hidden flexShrink={0} minWidth={width} width={width} />
+);
 
 export const Grid = ({
   dagRunState,
@@ -109,6 +114,8 @@ export const Grid = ({
 
   const { handleNewerRuns, handleOlderRuns, hasNewerRuns, hasOlderRuns, latestNotVisible } =
     useGridPagination({ gridRuns: dataGridRuns, limit, offset, setOffset });
+
+  const scrollbarSpacerWidth = hasNewerRuns || latestNotVisible ? "32px" : "16px";
 
   const { summariesByRunId } = useGridTiSummariesStream({
     dagId,
@@ -229,7 +236,7 @@ export const Grid = ({
             <DurationAxis top={`${GRID_HEADER_HEIGHT_PX / 2}px`} />
             <DurationAxis top="4px" />
             <Flex flexDirection="row-reverse">
-              {!showGantt && <ScrollbarSpacer />}
+              {!showGantt && <ScrollbarSpacer width={scrollbarSpacerWidth} />}
               {runsWithVersionFlags?.map((dr) => (
                 <Bar
                   key={dr.run_id}
@@ -259,7 +266,7 @@ export const Grid = ({
           <TaskNames nodes={flatNodes} onRowClick={handleRowClick} virtualItems={virtualItems} />
         </Box>
         <Flex flexDirection="row-reverse" flexShrink={0}>
-          {!showGantt && <ScrollbarSpacer />}
+          {!showGantt && <ScrollbarSpacer width={scrollbarSpacerWidth} />}
           {gridRuns?.map((dr: GridRunsResponse) => (
             <TaskInstancesColumn
               key={dr.run_id}

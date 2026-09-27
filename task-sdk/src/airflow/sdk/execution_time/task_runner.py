@@ -59,6 +59,7 @@ from airflow.sdk.api.datamodels._generated import (
     TIRunContext,
 )
 from airflow.sdk.bases.operator import BaseOperator, ExecutorSafeguard
+from airflow.sdk.bases.skipmixin import XCOM_SKIPMIXIN_KEY
 from airflow.sdk.bases.xcom import BaseXCom
 from airflow.sdk.configuration import conf
 from airflow.sdk.definitions._internal.dag_parsing_context import _airflow_parsing_context_manager
@@ -303,8 +304,12 @@ class RuntimeTaskInstance(TaskInstance):
         integrate_macros_plugins()
 
         dag_run_conf: dict[str, Any] | None = None
+        macros_accessor = MacrosAccessor()
         if from_server := self._ti_context_from_server:
             dag_run_conf = from_server.dag_run.conf or dag_run_conf
+            macros_accessor = MacrosAccessor(
+                team_name=from_server.dag_run.team_name, multi_team=bool(from_server.multi_team)
+            )
 
         validated_params = process_params(self.task.dag, self.task, dag_run_conf, suppress_exception=False)
 
@@ -323,7 +328,7 @@ class RuntimeTaskInstance(TaskInstance):
                 "ti": self,
                 "outlet_events": OutletEventAccessors(),
                 "inlet_events": InletEventsAccessors(self.task.inlets),
-                "macros": MacrosAccessor(),
+                "macros": macros_accessor,
                 "params": validated_params,
                 # TODO: Make this go through Public API longer term.
                 # "test_mode": task_instance.test_mode,
@@ -359,8 +364,6 @@ class RuntimeTaskInstance(TaskInstance):
                 "dag_run": dag_run,  # type: ignore[typeddict-item]  # Removable after #46522
                 "partition_key": dag_run.partition_key,
                 "partition_date": coerce_datetime(dag_run.partition_date),
-                "failure_kind": from_server.failure_kind,
-                "failure_reason": from_server.failure_reason,
                 "triggering_asset_events": TriggeringAssetEventsAccessor.build(
                     AssetEventDagRunReferenceResult.from_asset_event_dag_run_reference(event)
                     for event in dag_run.consumed_asset_events
@@ -904,6 +907,14 @@ def _xcom_push(
     """Push a XCom through XCom.set, which pushes to XCom Backend if configured."""
     # Private function, as we don't want to expose the ability to manually set `mapped_length` to SDK
     # consumers
+
+    if key == XCOM_SKIPMIXIN_KEY:
+        # The branch/skip decision is control-plane data the scheduler reads (via
+        # NotPreviouslySkippedDep) to skip mapped or cleared downstream tasks. It must
+        # bypass any custom XCom backend, which could externalize it into a pointer the
+        # scheduler cannot interpret, silently leaving those tasks unskipped (#50491).
+        _xcom_push_to_db(ti, key, value)
+        return
 
     XCom.set(
         key=key,
@@ -1651,7 +1662,7 @@ def _run_task_and_map_outcome(
     except (AirflowFailException, AirflowSensorTimeout) as e:
         # If AirflowFailException is raised, task should not retry.
         # If a sensor in reschedule mode reaches timeout, task should not retry.
-        log.exception("Task failed with exception")
+        log.exception("Task failed with exception", failure_kind=_get_task_failure_kind(e))
         log.info("::group::Post Execute")
         ti.end_date = datetime.now(tz=timezone.utc)
         msg = TaskState(
@@ -1663,7 +1674,7 @@ def _run_task_and_map_outcome(
         error = e
     except (AirflowTaskTimeout, AirflowException, AirflowRuntimeError) as e:
         # We should allow retries if the task has defined it.
-        log.exception("Task failed with exception")
+        log.exception("Task failed with exception", failure_kind=_get_task_failure_kind(e))
         log.info("::group::Post Execute")
         msg, state = _handle_current_task_failed(ti, e, log, context)
         error = e
@@ -1671,7 +1682,7 @@ def _run_task_and_map_outcome(
         # External state updates are already handled with `ti_heartbeat` and will be
         # updated already be another UI API. So, these exceptions should ideally never be thrown.
         # If these are thrown, we should mark the TI state as failed.
-        log.exception("Task failed with exception")
+        log.exception("Task failed with exception", failure_kind=_get_task_failure_kind(e))
         log.info("::group::Post Execute")
         ti.end_date = datetime.now(tz=timezone.utc)
         msg = TaskState(
@@ -1683,12 +1694,12 @@ def _run_task_and_map_outcome(
         error = e
     except SystemExit as e:
         # SystemExit needs to be retried if they are eligible.
-        log.error("Task exited", exit_code=e.code)
+        log.error("Task exited", exit_code=e.code, failure_kind=_get_task_failure_kind(e))
         log.info("::group::Post Execute")
         msg, state = _handle_current_task_failed(ti, e, log, context)
         error = e
     except BaseException as e:
-        log.exception("Task failed with exception")
+        log.exception("Task failed with exception", failure_kind=_get_task_failure_kind(e))
         log.info("::group::Post Execute")
         msg, state = _handle_current_task_failed(ti, e, log, context)
         error = e
@@ -1818,6 +1829,8 @@ def _evaluate_retry_policy(
             context=context,
         )
         if decision.reason:
+            # Close the group so the retry policy decision is not hidden inside "Post Execute".
+            log.info("::endgroup::")
             log.info("Retry policy decision", action=decision.action.value, reason=decision.reason)
         return decision
     except Exception:
@@ -1841,7 +1854,7 @@ def _handle_handler_failure(
     through the retry-count check, so an exception that means "do not retry" still means
     that when it surfaces from a handler.
     """
-    log.exception("Task failed with exception")
+    log.exception("Task failed with exception", failure_kind=_get_task_failure_kind(exception))
     if isinstance(exception, (AirflowFailException, AirflowSensorTimeout, AirflowTaskTerminated)):
         return _terminal_failure(ti), TaskInstanceState.FAILED, exception
     try:
@@ -1865,6 +1878,12 @@ def _terminal_failure(ti: RuntimeTaskInstance) -> TaskState:
     )
 
 
+def _get_task_failure_kind(error: BaseException | None) -> TaskFailureKind | None:
+    if error is None or isinstance(error, AirflowTaskTerminated):
+        return None
+    return TaskFailureKind.TIMEOUT if isinstance(error, AirflowTaskTimeout) else TaskFailureKind.APPLICATION
+
+
 def _handle_current_task_failed(
     ti: RuntimeTaskInstance,
     exception: BaseException,
@@ -1882,9 +1901,7 @@ def _handle_current_task_failed(
     """
     from airflow.sdk.definitions.retry_policy import RetryAction
 
-    failure_kind = (
-        TaskFailureKind.TIMEOUT if isinstance(exception, AirflowTaskTimeout) else TaskFailureKind.APPLICATION
-    )
+    failure_kind: TaskFailureKind | None = _get_task_failure_kind(exception)
     decision = _evaluate_retry_policy(ti, exception, log, context)
     if decision is not None and decision.action == RetryAction.FAIL:
         ti.end_date = datetime.now(tz=timezone.utc)
@@ -1898,12 +1915,12 @@ def _handle_current_task_failed(
         )
     if decision is not None and decision.action == RetryAction.RETRY:
         return _finalize_task_failure(
-            ti,
+            ti=ti,
             retry_delay_override=decision.retry_delay,
             retry_reason=decision.reason,
             failure_kind=failure_kind,
         )
-    return _finalize_task_failure(ti, failure_kind=failure_kind)
+    return _finalize_task_failure(ti=ti, failure_kind=failure_kind)
 
 
 def _finalize_task_failure(
@@ -1928,9 +1945,10 @@ def _finalize_task_failure(
     # `_handle_handler_failure`.
     if not ti._failure_metrics_emitted:
         operator = ti.task.__class__.__name__
-        stats_tags = ti.stats_tags
-        if failure_kind is not None:
-            stats_tags = {**stats_tags, "failure_kind": failure_kind.value}
+        stats_tags: dict[str, str] = {
+            **ti.stats_tags,
+            "failure_kind": failure_kind.value if failure_kind is not None else "unclassified",
+        }
 
         stats.incr("operator_failures", tags={**stats_tags, "operator_name": operator})
         stats.incr("ti_failures", tags=stats_tags)
@@ -2328,7 +2346,7 @@ def finalize(
     context: Context,
     log: Logger,
     error: BaseException | None = None,
-):
+) -> None:
     # Record task duration metrics for all terminal states
     if ti.start_date and ti.end_date:
         duration_ms = (ti.end_date - ti.start_date).total_seconds() * 1000
@@ -2358,12 +2376,7 @@ def finalize(
                 log.exception("Failed to set rendered fields during finalization", ti=ti, task=ti.task)
 
     log.debug("Running finalizers", ti=ti)
-    failure_kind = (
-        TaskFailureKind.TIMEOUT if isinstance(error, AirflowTaskTimeout) else TaskFailureKind.APPLICATION
-    )
-    if state in (TaskInstanceState.FAILED, TaskInstanceState.UP_FOR_RETRY):
-        context["failure_kind"] = failure_kind.value
-        context["failure_reason"] = None
+    failure_kind: TaskFailureKind | None = _get_task_failure_kind(error)
     if state == TaskInstanceState.SUCCESS:
         _run_task_state_change_callbacks(task, "on_success_callback", context, log)
         try:

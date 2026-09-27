@@ -23,6 +23,7 @@ import json
 import operator
 import os
 import pathlib
+import re
 from typing import TYPE_CHECKING, cast
 from unittest import mock
 from unittest.mock import patch
@@ -113,7 +114,7 @@ from airflow.utils.state import DagRunState, State, TaskInstanceState
 from airflow.utils.types import DagRunTriggeredByType, DagRunType
 
 from tests_common.test_utils import db
-from tests_common.test_utils.asserts import assert_queries_count
+from tests_common.test_utils.asserts import assert_queries_count, capture_orm_selects
 from tests_common.test_utils.config import conf_vars
 from tests_common.test_utils.db import clear_db_runs
 from tests_common.test_utils.mock_operators import MockOperator
@@ -2355,7 +2356,9 @@ class TestTaskInstance:
         assert ti_list[3].get_previous_ti(state=State.SUCCESS).run_id != ti_list[2].run_id
 
     @provide_session
-    def test_handle_failure_calls_listener(self, dag_maker, *, session: Session):
+    def test_handle_failure_calls_listener(
+        self, dag_maker, monkeypatch: pytest.MonkeyPatch, *, session: Session
+    ) -> None:
         class CustomOp(BaseOperator):
             def execute(self, context): ...
 
@@ -2365,7 +2368,11 @@ class TestTaskInstance:
         from airflow.listeners.listener import get_listener_manager
 
         listener_callback_on_error = mock.MagicMock()
-        get_listener_manager().pm.hook.on_task_instance_failed = listener_callback_on_error
+        monkeypatch.setattr(
+            target=get_listener_manager().pm.hook,
+            name="on_task_instance_failed",
+            value=listener_callback_on_error,
+        )
 
         with dag_maker(dag_id="test_handle_failure", start_date=start_date, schedule=None) as dag:
             task1 = CustomOp(
@@ -2432,7 +2439,12 @@ class TestTaskInstance:
         ti.task = None
         ti.state = State.QUEUED
         session.flush()
-        expected_stats_tags = {"dag_id": ti.dag_id, "task_id": ti.task_id, "run_type": dr.run_type}
+        expected_stats_tags = {
+            "dag_id": ti.dag_id,
+            "task_id": ti.task_id,
+            "run_type": dr.run_type,
+            "failure_kind": "unclassified",
+        }
 
         assert ti.task is None, "Check critical pre-condition"
 
@@ -2450,8 +2462,9 @@ class TestTaskInstance:
             "operator_failures", tags={**expected_stats_tags, "operator_name": "EmptyOperator"}
         )
 
+    @pytest.mark.parametrize("failure_kind", [None, *TaskFailureKind])
     @patch("airflow._shared.observability.metrics.stats._get_backend")
-    def test_handle_failure_tags_classified_cause(self, mock_get_backend, dag_maker):
+    def test_handle_failure_tags_classified_cause(self, mock_get_backend, failure_kind, dag_maker):
         backend = mock.MagicMock(spec=StatsLogger)
         mock_get_backend.return_value = backend
         session = settings.Session()
@@ -2466,13 +2479,12 @@ class TestTaskInstance:
             "dag_id": ti.dag_id,
             "task_id": ti.task_id,
             "run_type": dr.run_type,
-            "failure_kind": TaskFailureKind.INFRA.value,
+            "failure_kind": failure_kind.value if failure_kind is not None else "unclassified",
         }
 
         ti.handle_failure(
-            "infra kill",
-            failure_kind=TaskFailureKind.INFRA,
-            reason="Evicted",
+            error="task failed",
+            failure_kind=failure_kind,
             session=session,
         )
 
@@ -3593,6 +3605,27 @@ class TestMappedTaskInstanceReceiveValue:
         result = ti_downstream.xcom_pull(task_ids="unmapped_task", session=session)
         assert isinstance(result, dict), f"Expected dict for unmapped task, got {type(result)}"
         assert result == {"key": "value"}
+
+    def test_xcom_pull_single_value_query_is_bounded(self, dag_maker, session):
+        """Pulling one value from one task must ask the database for one row."""
+        with dag_maker(dag_id="test_xcom_pull_bounded", session=session):
+            upstream = PythonOperator(task_id="unmapped_task", python_callable=lambda: {"key": "value"})
+            downstream = PythonOperator(task_id="downstream", python_callable=lambda: None)
+            upstream >> downstream
+
+        dag_run = dag_maker.create_dagrun(logical_date=timezone.utcnow())
+        dag_maker.run_ti("unmapped_task", dag_run=dag_run, session=session)
+
+        ti_downstream = dag_run.get_task_instance("downstream", session=session)
+        ti_downstream.task = dag_maker.dag.task_dict["downstream"]
+
+        with capture_orm_selects("xcom") as statements:
+            result = ti_downstream.xcom_pull(task_ids="unmapped_task", session=session)
+
+        assert result == {"key": "value"}
+        assert statements, "expected xcom_pull to query the xcom table"
+        for sql in statements:
+            assert re.search(r"\bLIMIT 1\b", sql), f"xcom_pull is not bounded to one row: {sql}"
 
     def test_xcom_pull_returns_lazy_sequence_for_mapped_xcom(self, dag_maker, session):
         """

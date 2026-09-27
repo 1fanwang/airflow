@@ -166,6 +166,55 @@ If you want to control your task's state from within custom Task/Operator code, 
 
 These can be useful if your code has extra knowledge about its environment and wants to fail/skip faster - e.g., skipping when it knows there's no data available, or fast-failing when it detects its API key is invalid (as that will not be fixed by a retry).
 
+Failure causes
+--------------
+
+Airflow reports a failure category when the worker or executor can establish the cause:
+``infra``, ``application``, ``timeout``, or ``manual``. Otherwise the category remains unset.
+Infrastructure listeners and scheduler logs can also receive a short producer-owned reason,
+such as Kubernetes ``PreemptionByScheduler``.
+
+Worker loss, ``SIGKILL``, ``OOMKilled``, and pod deletion do not identify an infrastructure
+failure on their own. Kubernetes ``Evicted`` alone is also ambiguous because workload
+storage-limit violations use the same reason. A documented disruption condition can supply
+the missing evidence. An executor can retain a diagnostic reason while leaving the category unset.
+
+Tagged metrics backends add a bounded ``failure_kind`` label to ``ti_failures`` and
+``operator_failures``. An unset cause becomes ``unclassified`` in metrics only; listener
+arguments retain ``None``. Classic StatsD retains aggregate counts but drops these tags.
+
+Classification alone does not grant attempts, change retry or clear behavior, or add fields to the
+Dag callback context. See :doc:`/administration-and-deployment/listeners` for consuming
+the cause through infrastructure listener hooks.
+
+Infrastructure replacement attempts
+-----------------------------------
+
+Administrators can set :ref:`config:core__max_infra_retries` to grant additional attempts when an
+executor confirms that infrastructure stopped a task. The default is ``0``, which disables
+replacement attempts. No Dag or task setting is required, including for tasks with ``retries=0``.
+An unknown cause, generic worker loss, or a missed heartbeat does not qualify.
+
+The scheduler locks and refreshes the task instance before handling an executor failure. Only a
+``RUNNING`` task with a positive attempt number can receive a replacement. Queued, cleared and
+already-handled states do not produce an infrastructure policy decision. The scheduler increases
+the existing ``max_tries`` before deciding the retry state, callback, and email notification.
+For each running failure it recomputes
+``max((max_tries or 0) - (retries or 0), try_number - 1, 0)`` and grants a replacement
+only if that inferred position is below ``max_infra_retries``.
+
+This is a conservative ceiling rather than a separate count of infrastructure failures. Ordinary
+attempts and task clears can consume the allowance without any infrastructure replacement. An early
+refusal can change after normal retries are edited, because ``max_tries - retries`` can decrease.
+Once ``try_number - 1`` reaches the configured cap, neither clears nor normal-retry edits can
+restore eligibility under that same cap. These persisted fields survive scheduler restarts.
+After a refusal, normal retry handling still applies.
+
+``ti_infra_retry_granted`` counts granted replacements, and ``ti_infra_retry_denied`` counts
+confirmed running infrastructure failures refused by the enabled policy's current ceiling. Neither
+increments when the policy is disabled or the cause is not infrastructure. These named counters
+also work with classic StatsD and use the existing task metric tags on tagged backends.
+
 .. _concepts:retry-policies:
 
 Retry Policies
@@ -265,6 +314,40 @@ share one policy. Per-index variation is not supported on ``.expand()``, but the
 policy's ``evaluate()`` method receives the exception, ``try_number``, and full
 context, so per-index branching can be done inside the policy if needed.
 
+Chaining policies
+~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 3.4.0
+
+``ChainRetryPolicy`` consults policies in order. The first RETRY or FAIL wins; a
+policy that returns DEFAULT has nothing to add and the next one is asked. When every
+policy returns DEFAULT, the task's own ``retries`` and ``retry_delay`` apply. Every
+policy sees the original task exception.
+
+.. exampleinclude:: /../src/airflow/example_dags/example_retry_policy.py
+    :language: python
+    :start-after: [START retry_policy_chain]
+    :end-before: [END retry_policy_chain]
+
+This is how to put a cheap, deterministic policy in front of a slow or costly one, or
+to give a policy that can fail on its own (one that calls a model, for instance) a
+deterministic floor behind it. The policies need not know about each other, and they can
+come from different packages.
+
+Two consequences of "DEFAULT means next" to keep in mind:
+
+* A ``RetryRule`` with ``action=RetryAction.DEFAULT`` passes control on rather than
+  ending the chain. Its ``retry_delay`` is dropped, as it is on any DEFAULT.
+* An ``ExceptionRetryPolicy`` with ``default=RetryAction.FAIL`` fails every exception
+  its rules do not match, so it ends the chain wherever it sits.
+
+A policy that raises an ordinary exception, or returns something other than a
+``RetryDecision``, is logged and treated as DEFAULT, so one broken policy does not take the
+rules after it down with it. The winning decision's reason names the policy that decided and
+then what the earlier ones said (``HTTPStatusRetryPolicy: HTTP 503 (after ExceptionRetryPolicy:
+no decision)``). On a RETRY that string is the task's ``retry_reason``; on FAIL, or when no
+policy decided, it appears in the task log as the ``Retry policy decision`` line.
+
 Custom retry policies
 ~~~~~~~~~~~~~~~~~~~~~
 
@@ -291,7 +374,7 @@ number, max tries, and the full Airflow context (``dag_run``, ``params``, etc.):
                 status = exception.response.status_code
                 if status == 429:  # rate limited -- honour Retry-After header
                     retry_after = int(exception.response.headers.get("Retry-After", 60))
-                    return RetryDecision.retry(retry_delay=timedelta(seconds=retry_after))
+                    return RetryDecision.retry(delay=timedelta(seconds=retry_after))
                 if 500 <= status < 600:  # server error -- worth retrying
                     return RetryDecision.retry()
                 if 400 <= status < 500:  # client error -- not retryable
@@ -313,6 +396,14 @@ DAG was triggered:
             if context and context["dag_run"].run_type == "backfill":
                 return RetryDecision.fail(reason="Backfill run -- not retrying")
             return RetryDecision.default()
+
+A retry policy only decides whether and when a task gets another attempt. It
+receives the full run ``context``, so it can inspect checkpointed progress
+through ``context["task_state_store"]`` when making that decision, but it
+never persists or restores that progress itself -- resuming from a checkpoint
+is the task's own work. For a task that also needs to resume from where it
+left off, pair a retry policy with the task state store described in
+:ref:`concepts-resumable-tasks-retry-policies`.
 
 .. _concepts:task-instance-heartbeat-timeout:
 

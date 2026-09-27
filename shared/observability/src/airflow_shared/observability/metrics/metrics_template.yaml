@@ -40,7 +40,8 @@ metrics:
     name_variables: ["job_name"]
 
   - name: "operator_failures"
-    description: "Operator ``{operator_name}`` failures."
+    description: "Operator ``{operator_name}`` failures. Tagged backends include ``failure_kind``:
+    ``infra``, ``application``, ``timeout``, ``manual``, or ``unclassified``."
     type: "counter"
     legacy_name: "operator_failures_{operator_name}"
     name_variables: ["operator_name"]
@@ -87,7 +88,23 @@ metrics:
     name_variables: []
 
   - name: "ti_failures"
-    description: "Overall task instances failures. Metric with dag_id and task_id tagging."
+    description: "Failed task attempts with ``dag_id``, ``task_id``, and bounded ``failure_kind`` tagging.
+    An unset cause is tagged as ``unclassified``."
+    type: "counter"
+    legacy_name: "-"
+    name_variables: []
+
+  - name: "ti_infra_retry_granted"
+    description: "Replacement attempts granted for confirmed infrastructure failures.
+    Disabled policies and non-infrastructure failures do not increment this counter."
+    type: "counter"
+    legacy_name: "-"
+    name_variables: []
+
+  - name: "ti_infra_retry_denied"
+    description: "Confirmed running infrastructure failures refused a replacement by the enabled policy's
+    current inferred ceiling. Ordinary retries may remain, and an early refusal can change after retry-setting
+    edits. Disabled policies and non-infrastructure failures do not increment this counter."
     type: "counter"
     legacy_name: "-"
     name_variables: []
@@ -495,10 +512,18 @@ metrics:
     name_variables: []
 
   - name: "scheduler.dagruns.running"
-    description: "Number of DAGs whose latest DagRun is currently in the ``RUNNING`` state"
+    description: "Number of DagRuns currently in the ``RUNNING`` state. Emitted as a single aggregate
+    value by default; tagged by dag_id instead when ``[scheduler] dagrun_metrics_per_dag_id`` is enabled."
     type: "gauge"
-    legacy_name: "-"
-    name_variables: []
+    legacy_name: "scheduler.dagruns.running.{dag_id}"
+    name_variables: ["dag_id"]
+
+  - name: "scheduler.dagruns.queued"
+    description: "Number of DagRuns currently in the ``QUEUED`` state. Emitted as a single aggregate
+    value by default; tagged by dag_id instead when ``[scheduler] dagrun_metrics_per_dag_id`` is enabled."
+    type: "gauge"
+    legacy_name: "scheduler.dagruns.queued.{dag_id}"
+    name_variables: ["dag_id"]
 
   - name: "executor.open_slots"
     description: "Number of open slots on executor. Legacy metric only emitted
