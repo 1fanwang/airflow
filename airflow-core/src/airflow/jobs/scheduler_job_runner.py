@@ -1484,6 +1484,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         query = (
             select(TI)
             .where(filter_for_tis)
+            .order_by(TI.dag_id, TI.task_id, TI.run_id, TI.map_index)
             .options(selectinload(TI.dag_model))
             .options(asset_loader)
             .options(alias_loader)
@@ -1501,6 +1502,8 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         locked_query = with_row_locks(query, of=TI, session=session, skip_locked=True)
         tis: Iterator[TI] = session.scalars(locked_query)
         for ti in tis:
+            # An earlier failure can commit and release the batch's locks.
+            ti.refresh_from_db(session=session, lock_for_update=True)
             try_number = ti_primary_key_to_try_number_map[ti.key.primary]
             buffer_key = ti.key.with_try_number(try_number)
             if ti.try_number != try_number:
@@ -1628,6 +1631,24 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     ti.set_state(state)
                     continue
                 ti.task = task
+
+                if ti.state == TaskInstanceState.RESTARTING and state == TaskInstanceState.SUCCESS:
+                    cls.logger().info(
+                        "Task %s was cleared and successfully terminated. Setting to scheduled for retry.",
+                        ti,
+                    )
+                    ti.max_tries = ti.try_number + ti.task.retries
+                    ti.set_state(None)
+                    continue
+
+                ti.handle_failure(
+                    error=msg,
+                    session=session,
+                    failure_kind=failure_kind,
+                    reason=reason,
+                )
+                final_state: TaskInstanceState = cast("TaskInstanceState", ti.state)
+
                 if task.has_on_retry_callback or task.has_on_failure_callback:
                     # Only log the error/extra info here, since the `ti.handle_failure()` path will log it
                     # too, which would lead to double logging
@@ -1654,11 +1675,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                         version_data=_version_data,
                         ti=ti,
                         msg=msg,
-                        task_callback_type=(
-                            TaskInstanceState.UP_FOR_RETRY
-                            if ti.is_eligible_to_retry()
-                            else TaskInstanceState.FAILED
-                        ),
+                        task_callback_type=final_state,
                         context_from_server=TIRunContext(
                             dag_run=DRDataModel.model_validate(ti.dag_run, from_attributes=True),
                             max_tries=ti.max_tries,
@@ -1668,17 +1685,6 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                         ),
                     )
                     executor.send_callback(request)
-
-                # Handle cleared tasks that were successfully terminated by executor
-                if ti.state == TaskInstanceState.RESTARTING and state == TaskInstanceState.SUCCESS:
-                    cls.logger().info(
-                        "Task %s was cleared and successfully terminated. Setting to scheduled for retry.",
-                        ti,
-                    )
-                    # Adjust max_tries to allow retry beyond normal limits (like clearing does)
-                    ti.max_tries = ti.try_number + ti.task.retries
-                    ti.set_state(None)
-                    continue
 
                 # Send email notification request to DAG processor via DB
                 if task.email and (task.email_on_failure or task.email_on_retry):
@@ -1705,7 +1711,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                         version_data=_email_version_data,
                         ti=ti,
                         msg=msg,
-                        email_type="retry" if ti.is_eligible_to_retry() else "failure",
+                        email_type="retry" if final_state == TaskInstanceState.UP_FOR_RETRY else "failure",
                         context_from_server=TIRunContext(
                             dag_run=DRDataModel.model_validate(ti.dag_run, from_attributes=True),
                             max_tries=ti.max_tries,
@@ -1715,14 +1721,6 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                         ),
                     )
                     executor.send_callback(email_request)
-
-                # Update task state - emails are handled by DAG processor now
-                ti.handle_failure(
-                    error=msg,
-                    session=session,
-                    failure_kind=failure_kind,
-                    reason=reason,
-                )
 
         cls._emit_executor_events_batch_metrics(num_events)
         return len(event_buffer)

@@ -75,6 +75,7 @@ from airflow._shared.observability.traces import (
     new_dagrun_trace_carrier,
     new_task_run_carrier,
 )
+from airflow._shared.state import TaskFailureKind
 from airflow._shared.timezones import timezone
 from airflow.assets.manager import asset_manager
 from airflow.configuration import conf
@@ -122,7 +123,6 @@ if TYPE_CHECKING:
     from sqlalchemy.sql import Update
     from sqlalchemy.sql.elements import ColumnElement
 
-    from airflow._shared.state import TaskFailureKind
     from airflow.api_fastapi.execution_api.datamodels.asset import AssetProfile
     from airflow.models.dag import DagModel
     from airflow.models.dagrun import DagRun
@@ -593,6 +593,58 @@ def _date_or_empty(*, task_instance: TaskInstance, attr: str) -> str:
     """
     result: datetime | None = getattr(task_instance, attr, None)
     return result.strftime("%Y%m%dT%H%M%S") if result else ""
+
+
+def _maybe_use_infra_retry(
+    *,
+    task_instance: TaskInstance,
+    task: Operator | None,
+    failure_kind: TaskFailureKind | None,
+    reason: str | None = None,
+) -> bool:
+    """Grant a replacement for a running failure within the deployment's inferred ceiling."""
+    if failure_kind != TaskFailureKind.INFRA or task is None:
+        return False
+
+    infra_retries: int = conf.getint("core", "max_infra_retries", fallback=0)
+    if infra_retries <= 0:
+        return False
+
+    if task_instance.state != TaskInstanceState.RUNNING:
+        return False
+    if task_instance.try_number < 1:
+        log.warning("Ignoring infrastructure retry for an unstarted task instance: %s", task_instance)
+        return False
+
+    inferred_position: int = max(
+        (task_instance.max_tries or 0) - (task.retries or 0),
+        task_instance.try_number - 1,
+        0,
+    )
+    if inferred_position >= infra_retries:
+        stats.incr("ti_infra_retry_denied", tags=task_instance.stats_tags)
+        log.info(
+            "Infrastructure retry refused by conservative ceiling for %s; "
+            "inferred_position=%s, cap=%s, prior_attempts=%s, reason=%s",
+            task_instance,
+            inferred_position,
+            infra_retries,
+            task_instance.try_number - 1,
+            reason,
+        )
+        return False
+
+    task_instance.max_tries = (task_instance.max_tries or 0) + 1
+    stats.incr("ti_infra_retry_granted", tags=task_instance.stats_tags)
+    log.info(
+        "Using infrastructure replacement at inferred position %s/%s for %s; reason=%s, max_tries=%s",
+        inferred_position + 1,
+        infra_retries,
+        task_instance,
+        reason,
+        task_instance.max_tries,
+    )
+    return True
 
 
 def uuid7() -> UUID:
@@ -1936,7 +1988,14 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         # Actual callbacks are handled by the DAG processor, not the scheduler
         task = getattr(ti, "task", None)
 
-        if not ti.is_eligible_to_retry():
+        infra_retry_granted: bool = _maybe_use_infra_retry(
+            task_instance=ti,
+            task=task,
+            failure_kind=failure_kind,
+            reason=reason,
+        )
+
+        if not infra_retry_granted and not ti.is_eligible_to_retry():
             ti.state = TaskInstanceState.FAILED
 
             if task and fail_fast:

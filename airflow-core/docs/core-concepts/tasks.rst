@@ -183,9 +183,37 @@ Tagged metrics backends add a bounded ``failure_kind`` label to ``ti_failures`` 
 ``operator_failures``. An unset cause becomes ``unclassified`` in metrics only; listener
 arguments retain ``None``. Classic StatsD retains aggregate counts but drops these tags.
 
-Classification does not grant attempts, change retry or clear behavior, or add fields to the
+Classification alone does not grant attempts, change retry or clear behavior, or add fields to the
 Dag callback context. See :doc:`/administration-and-deployment/listeners` for consuming
 the cause through infrastructure listener hooks.
+
+Infrastructure replacement attempts
+-----------------------------------
+
+Administrators can set :ref:`config:core__max_infra_retries` to grant additional attempts when an
+executor confirms that infrastructure stopped a task. The default is ``0``, which disables
+replacement attempts. No Dag or task setting is required, including for tasks with ``retries=0``.
+An unknown cause, generic worker loss, or a missed heartbeat does not qualify.
+
+The scheduler locks and refreshes the task instance before handling an executor failure. Only a
+``RUNNING`` task with a positive attempt number can receive a replacement. Queued, cleared and
+already-handled states do not produce an infrastructure policy decision. The scheduler increases
+the existing ``max_tries`` before deciding the retry state, callback, and email notification.
+For each running failure it recomputes
+``max((max_tries or 0) - (retries or 0), try_number - 1, 0)`` and grants a replacement
+only if that inferred position is below ``max_infra_retries``.
+
+This is a conservative ceiling rather than a separate count of infrastructure failures. Ordinary
+attempts and task clears can consume the allowance without any infrastructure replacement. An early
+refusal can change after normal retries are edited, because ``max_tries - retries`` can decrease.
+Once ``try_number - 1`` reaches the configured cap, neither clears nor normal-retry edits can
+restore eligibility under that same cap. These persisted fields survive scheduler restarts.
+After a refusal, normal retry handling still applies.
+
+``ti_infra_retry_granted`` counts granted replacements, and ``ti_infra_retry_denied`` counts
+confirmed running infrastructure failures refused by the enabled policy's current ceiling. Neither
+increments when the policy is disabled or the cause is not infrastructure. These named counters
+also work with classic StatsD and use the existing task metric tags on tagged backends.
 
 .. _concepts:retry-policies:
 

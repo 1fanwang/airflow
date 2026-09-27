@@ -94,6 +94,21 @@ metrics:
     legacy_name: "-"
     name_variables: []
 
+  - name: "ti_infra_retry_granted"
+    description: "Replacement attempts granted for confirmed infrastructure failures.
+    Disabled policies and non-infrastructure failures do not increment this counter."
+    type: "counter"
+    legacy_name: "-"
+    name_variables: []
+
+  - name: "ti_infra_retry_denied"
+    description: "Confirmed running infrastructure failures refused a replacement by the enabled policy's
+    current inferred ceiling. Ordinary retries may remain, and an early refusal can change after retry-setting
+    edits. Disabled policies and non-infrastructure failures do not increment this counter."
+    type: "counter"
+    legacy_name: "-"
+    name_variables: []
+
   - name: "ti_successes"
     description: "Overall task instances successes. Metric with dag_id and task_id tagging."
     type: "counter"
