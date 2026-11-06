@@ -78,6 +78,7 @@ class TaskInstanceHistory(Base):
     run_id: Mapped[str] = mapped_column(StringID(), nullable=False)
     map_index: Mapped[int] = mapped_column(Integer, nullable=False, server_default="-1")
     try_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    infra_continuation_number: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     start_date: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     end_date: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     duration: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -172,6 +173,7 @@ class TaskInstanceHistory(Base):
             "run_id",
             "map_index",
             "try_number",
+            "infra_continuation_number",
             name="task_instance_history_dtrt_uq",
         ),
         Index("idx_tih_dag_run", dag_id, run_id),
@@ -191,7 +193,12 @@ class TaskInstanceHistory(Base):
 
     @staticmethod
     @provide_session
-    def record_ti(ti: TaskInstance, *, session: Session = NEW_SESSION) -> None:
+    def record_ti(
+        ti: TaskInstance,
+        *,
+        session: Session = NEW_SESSION,
+        is_infra_continuation: bool = False,
+    ) -> None:
         """Record a TaskInstance to TaskInstanceHistory."""
         exists_q = session.scalar(
             select(func.count(TaskInstanceHistory.task_id)).where(
@@ -200,12 +207,15 @@ class TaskInstanceHistory(Base):
                 TaskInstanceHistory.run_id == ti.run_id,
                 TaskInstanceHistory.map_index == ti.map_index,
                 TaskInstanceHistory.try_number == ti.try_number,
+                TaskInstanceHistory.infra_continuation_number == ti.infra_continuation_number,
             )
         )
         if exists_q:
             return
         ti_history_state = ti.state
-        if ti.state not in State.finished:
+        if is_infra_continuation:
+            ti_history_state = TaskInstanceState.UP_FOR_RESCHEDULE
+        elif ti.state not in State.finished:
             ti_history_state = TaskInstanceState.FAILED
             # Callers that know when the try actually ended (e.g. the Execution API
             # retry path) pre-set end_date and duration; only stamp archive time when unset.

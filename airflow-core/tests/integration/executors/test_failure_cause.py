@@ -37,11 +37,11 @@ from tests_common.test_utils.mock_executor import MockExecutor
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from uuid import UUID
 
     from sqlalchemy.orm import Session
 
     from airflow.models.dagrun import DagRun
-    from airflow.models.taskinstancekey import TaskInstanceKey
 
     from tests_common.pytest_plugin import DagMaker
 
@@ -49,24 +49,21 @@ pytestmark = pytest.mark.db_test
 
 
 @pytest.mark.parametrize(
-    ("cap", "retries", "max_tries", "try_number", "expected_state", "expected_max_tries"),
+    ("cap", "retries", "try_number", "prior_continuations", "expected_state"),
     [
-        (0, 0, 0, 1, TaskInstanceState.FAILED, 0),
-        (0, 0, 3, 1, TaskInstanceState.FAILED, 3),
-        (1, 0, 3, 1, TaskInstanceState.FAILED, 3),
-        (1, 0, 0, 1, TaskInstanceState.UP_FOR_RETRY, 1),
-        (3, 0, 0, 2, TaskInstanceState.UP_FOR_RETRY, 1),
-        (1, 0, 1, 2, TaskInstanceState.FAILED, 1),
-        (1, 2, 2, 2, TaskInstanceState.UP_FOR_RETRY, 2),
+        pytest.param(0, 0, 1, 0, TaskInstanceState.FAILED, id="disabled"),
+        pytest.param(1, 0, 1, 0, TaskInstanceState.UP_FOR_RESCHEDULE, id="continue_zero_retry"),
+        pytest.param(1, 2, 2, 0, TaskInstanceState.UP_FOR_RESCHEDULE, id="continue_second_try"),
+        pytest.param(1, 0, 1, 1, TaskInstanceState.FAILED, id="exhausted_fails"),
+        pytest.param(1, 2, 1, 1, TaskInstanceState.UP_FOR_RETRY, id="exhausted_retries"),
     ],
 )
-def test_infrastructure_retry_precedes_all_failure_consumers(
+def test_infrastructure_continuation_precedes_failure_consumers(
     cap: int,
     retries: int,
-    max_tries: int,
     try_number: int,
+    prior_continuations: int,
     expected_state: TaskInstanceState,
-    expected_max_tries: int,
     dag_maker: DagMaker,
     listener_manager: Callable[[object], None],
     session: Session,
@@ -81,7 +78,7 @@ def test_infrastructure_retry_precedes_all_failure_consumers(
             failure_kind: TaskFailureKind | None,
             reason: str | None,
         ) -> None:
-            received.append((task_instance.state, task_instance.max_tries, failure_kind, reason))
+            received.append((task_instance.state, task_instance.try_number, failure_kind, reason))
 
     listener_manager(FailureListener())
     with dag_maker(dag_id="infra_retry_consumers", fileloc="/infra_retry/"):
@@ -100,12 +97,18 @@ def test_infrastructure_retry_precedes_all_failure_consumers(
     assert ti is not None
     ti.state = TaskInstanceState.RUNNING
     ti.try_number = try_number
-    ti.max_tries = max_tries
+    ti.max_tries = retries
+    ti.infra_reschedule_count = prior_continuations
     ti.queued_by_job_id = 1
     session.flush()
     executor = MockExecutor(do_update=False)
     runner = SchedulerJobRunner(job=Job(), executors=[executor])
-    executor.fail(key=ti.key, failure_kind=TaskFailureKind.INFRA, reason="PreemptionByScheduler")
+    executor.fail(
+        key=ti.key,
+        task_instance_id=ti.id,
+        failure_kind=TaskFailureKind.INFRA,
+        reason="PreemptionByScheduler",
+    )
 
     with conf_vars({("core", "max_infra_retries"): str(cap)}):
         SchedulerJobRunner.process_executor_events(
@@ -116,25 +119,25 @@ def test_infrastructure_retry_precedes_all_failure_consumers(
         )
     ti.refresh_from_db(session=session)
 
-    assert (ti.state, ti.max_tries) == (expected_state, expected_max_tries)
-    assert received == [(expected_state, expected_max_tries, TaskFailureKind.INFRA, "PreemptionByScheduler")]
+    assert (ti.state, ti.try_number, ti.max_tries) == (expected_state, try_number, retries)
+    assert received == [(expected_state, try_number, TaskFailureKind.INFRA, "PreemptionByScheduler")]
     assert isinstance(executor.callback_sink, mock.MagicMock)
+    if expected_state == TaskInstanceState.UP_FOR_RESCHEDULE:
+        executor.callback_sink.send.assert_not_called()
+        return
     callback: TaskCallbackRequest = executor.callback_sink.send.call_args_list[0].args[0]
     email: EmailRequest = executor.callback_sink.send.call_args_list[1].args[0]
     assert executor.callback_sink.send.call_count == 2
     assert isinstance(callback, TaskCallbackRequest)
     assert callback.task_callback_type == expected_state
-    assert callback.context_from_server is not None
-    assert callback.context_from_server.max_tries == expected_max_tries
     assert isinstance(email, EmailRequest)
     assert email.email_type == ("retry" if expected_state == TaskInstanceState.UP_FOR_RETRY else "failure")
-    assert email.context_from_server.max_tries == expected_max_tries
 
 
-@pytest.mark.parametrize("stale", [False, True], ids=["duplicate", "earlier_attempt"])
+@pytest.mark.parametrize("stale", [False, True], ids=["duplicate", "continuation_running"])
 @conf_vars({("core", "max_infra_retries"): "3"})
 @mock.patch("airflow.models.taskinstance.stats.incr", autospec=True)
-def test_executor_event_does_not_grant_a_second_replacement(
+def test_interrupted_execution_event_does_not_grant_a_second_continuation(
     mock_incr: mock.MagicMock, stale: bool, dag_maker: DagMaker, session: Session
 ) -> None:
     with dag_maker(dag_id="infra_duplicate"):
@@ -147,29 +150,29 @@ def test_executor_event_does_not_grant_a_second_replacement(
     ti.try_number = 1
     ti.queued_by_job_id = 1
     session.flush()
-    key: TaskInstanceKey = ti.key
+    interrupted_id: UUID = ti.id
     executor = MockExecutor(do_update=False)
     runner = SchedulerJobRunner(job=Job(), executors=[executor])
-    executor.fail(key=key, failure_kind=TaskFailureKind.INFRA)
+    executor.fail(key=ti.key, task_instance_id=interrupted_id, failure_kind=TaskFailureKind.INFRA)
     SchedulerJobRunner.process_executor_events(
         executor=executor, job_id=1, scheduler_dag_bag=runner.scheduler_dag_bag, session=session
     )
     ti.refresh_from_db(session=session)
-    assert (ti.state, ti.max_tries) == (TaskInstanceState.UP_FOR_RETRY, 1)
+    assert (ti.state, ti.try_number, ti.infra_reschedule_count) == (TaskInstanceState.UP_FOR_RESCHEDULE, 1, 1)
+    assert ti.id != interrupted_id
     if stale:
         ti.state = TaskInstanceState.RUNNING
-        ti.try_number = 2
         session.flush()
+    expected_state: TaskInstanceState = TaskInstanceState(ti.state)
     mock_incr.reset_mock()
-    executor.fail(key=key, failure_kind=TaskFailureKind.INFRA)
+    executor.fail(key=ti.key, task_instance_id=interrupted_id, failure_kind=TaskFailureKind.INFRA)
 
     SchedulerJobRunner.process_executor_events(
         executor=executor, job_id=1, scheduler_dag_bag=runner.scheduler_dag_bag, session=session
     )
     ti.refresh_from_db(session=session)
 
-    assert ti.max_tries == 1
-    assert ti.state == (TaskInstanceState.RUNNING if stale else TaskInstanceState.UP_FOR_RETRY)
+    assert (ti.state, ti.try_number, ti.infra_reschedule_count) == (expected_state, 1, 1)
     assert not any(call.args[0].startswith("ti_infra_retry_") for call in mock_incr.call_args_list)
 
 

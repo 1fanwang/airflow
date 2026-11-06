@@ -80,7 +80,10 @@ from sqlalchemy import select
 
 from airflow.api_fastapi.auth.tokens import JWTGenerator, JWTValidator
 from airflow.api_fastapi.execution_api.datamodels.token import TIClaims, TIToken, TokenScope
-from airflow.api_fastapi.execution_api.deps import DepContainer
+from airflow.api_fastapi.execution_api.deps import DepContainer, SessionDep
+from airflow.models.taskinstance import TaskInstance
+from airflow.models.taskinstancehistory import TaskInstanceHistory
+from airflow.utils.state import TaskInstanceState
 
 log = structlog.get_logger(logger_name=__name__)
 
@@ -144,10 +147,55 @@ class JWTBearer(HTTPBearer):
 _jwt_bearer = JWTBearer()
 
 
+def fence_task_execution(
+    request: Request,
+    session: SessionDep,
+    token: TIToken = Depends(_jwt_bearer),
+) -> None:
+    """Serialize mutations with execution retirement, including logical-coordinate writes."""
+    if request.method in {"GET", "HEAD", "OPTIONS"} or request.scope.get("execution_api_fenced"):
+        return
+    route = request.scope.get("route")
+    if token.claims.scope not in getattr(route, "allowed_token_types", frozenset({"execution"})):
+        return
+    # Callback and connection-test tokens identify other workloads, not a task execution.
+    if token.claims.scope != "execution" and "task_instance_id" not in request.path_params:
+        return
+    if "task_instance_id" in request.path_params and str(request.path_params["task_instance_id"]) != str(
+        token.id
+    ):
+        return
+    current_id = session.scalar(
+        select(TaskInstance.id).where(TaskInstance.id == token.id).with_for_update(of=TaskInstance)
+    )
+    if current_id is not None:
+        request.scope["execution_api_fenced"] = True
+        return
+    retired_state = session.scalar(
+        select(TaskInstanceHistory.state)
+        .where(TaskInstanceHistory.task_instance_id == token.id)
+        .with_for_update(of=TaskInstanceHistory)
+    )
+    if retired_state is None:
+        if "task_instance_id" in request.path_params:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason": "scope_not_found", "message": "Task instance not found"},
+        )
+    if retired_state == TaskInstanceState.UP_FOR_RESCHEDULE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"reason": "execution_replaced", "message": "This task execution was replaced"},
+        )
+    request.scope["execution_api_fenced"] = True
+
+
 async def require_auth(
     security_scopes: SecurityScopes,
     request: Request,
     token: TIToken = Depends(_jwt_bearer),
+    _execution_fence: None = Depends(fence_task_execution),
 ) -> TIToken:
     """
     Security dependency that enforces token type and ``ti:self`` scope.

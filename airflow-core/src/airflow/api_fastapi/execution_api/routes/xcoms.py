@@ -25,13 +25,13 @@ from pydantic import JsonValue
 from sqlalchemy import delete
 from sqlalchemy.sql.selectable import Select
 
-from airflow.api_fastapi.common.db.common import SessionDep
 from airflow.api_fastapi.core_api.base import BaseModel
 from airflow.api_fastapi.execution_api.datamodels.xcom import (
     XComResponse,
     XComSequenceIndexResponse,
     XComSequenceSliceResponse,
 )
+from airflow.api_fastapi.execution_api.deps import SessionDep
 from airflow.api_fastapi.execution_api.security import CurrentTIToken
 from airflow.models.taskmap import TaskMap
 from airflow.models.xcom import XComModel

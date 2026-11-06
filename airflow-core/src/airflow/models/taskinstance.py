@@ -91,6 +91,7 @@ from airflow.models.deadline_alert import DeadlineAlert as DeadlineAlertModel
 # Import HITLDetail at runtime so SQLAlchemy can resolve the relationship
 from airflow.models.hitl import HITLDetail  # noqa: F401
 from airflow.models.log import Log
+from airflow.models.taskinstancehistory import TaskInstanceHistory
 from airflow.models.taskinstancekey import TaskInstanceKey
 from airflow.models.taskmap import TaskMap
 from airflow.models.taskreschedule import TaskReschedule
@@ -406,6 +407,7 @@ def clear_task_instances(
     scheduler_dagbag = DBDagBag(load_op_links=False)
     for ti in tis:
         ti.prepare_db_for_next_try(session)
+        ti.infra_reschedule_count = 0
 
         if ti.state == TaskInstanceState.RUNNING:
             if prevent_running_task:
@@ -595,54 +597,77 @@ def _date_or_empty(*, task_instance: TaskInstance, attr: str) -> str:
     return result.strftime("%Y%m%dT%H%M%S") if result else ""
 
 
-def _maybe_use_infra_retry(
+def _reschedule_infra_failure_if_eligible(
     *,
     task_instance: TaskInstance,
     task: Operator | None,
     failure_kind: TaskFailureKind | None,
+    session: Session,
     reason: str | None = None,
 ) -> bool:
-    """Grant a replacement for a running failure within the deployment's inferred ceiling."""
-    if failure_kind != TaskFailureKind.INFRA or task is None:
+    """Continue a confirmed interrupted execution without consuming an application retry."""
+    if (
+        failure_kind != TaskFailureKind.INFRA
+        or task is None
+        or task_instance.state != TaskInstanceState.RUNNING
+    ):
         return False
 
-    infra_retries: int = conf.getint("core", "max_infra_retries", fallback=0)
-    if infra_retries <= 0:
-        return False
-
-    if task_instance.state != TaskInstanceState.RUNNING:
+    max_infra_retries: int = conf.getint("core", "max_infra_retries", fallback=0)
+    if max_infra_retries <= 0:
         return False
     if task_instance.try_number < 1:
         log.warning("Ignoring infrastructure retry for an unstarted task instance: %s", task_instance)
         return False
-
-    inferred_position: int = max(
-        (task_instance.max_tries or 0) - (task.retries or 0),
-        task_instance.try_number - 1,
-        0,
-    )
-    if inferred_position >= infra_retries:
+    if task_instance.infra_reschedule_count >= max_infra_retries:
         stats.incr("ti_infra_retry_denied", tags=task_instance.stats_tags)
-        log.info(
-            "Infrastructure retry refused by conservative ceiling for %s; "
-            "inferred_position=%s, cap=%s, prior_attempts=%s, reason=%s",
-            task_instance,
-            inferred_position,
-            infra_retries,
-            task_instance.try_number - 1,
-            reason,
-        )
         return False
 
-    task_instance.max_tries = (task_instance.max_tries or 0) + 1
+    interrupted_id: UUID = task_instance.id
+    interrupted_at: datetime = task_instance.end_date or timezone.utcnow()
+    reschedule_date: datetime = task_instance.next_retry_datetime()
+    TaskInstanceHistory.record_ti(ti=task_instance, session=session, is_infra_continuation=True)
+    task_instance.id = uuid7()
+    task_instance.infra_reschedule_count += 1
+    task_instance.infra_continuation_number += 1
+    task_instance.state = TaskInstanceState.UP_FOR_RESCHEDULE
+    task_instance.external_executor_id = None
+    task_instance.last_heartbeat_at = None
+    task_instance.pid = None
+    task_instance.clear_next_method_args()
+    session.flush()
+    session.add(
+        TaskReschedule(
+            ti_id=task_instance.id,
+            start_date=task_instance.start_date or interrupted_at,
+            end_date=interrupted_at,
+            reschedule_date=reschedule_date,
+        )
+    )
+    session.add(
+        Log(
+            event=TaskInstanceState.UP_FOR_RESCHEDULE.value,
+            task_instance=task_instance,
+            extra=json.dumps(
+                {
+                    "interrupted_execution_id": str(interrupted_id),
+                    "continuation_execution_id": str(task_instance.id),
+                    "infra_reschedule_count": task_instance.infra_reschedule_count,
+                    "reason": reason,
+                }
+            ),
+        )
+    )
     stats.incr("ti_infra_retry_granted", tags=task_instance.stats_tags)
     log.info(
-        "Using infrastructure replacement at inferred position %s/%s for %s; reason=%s, max_tries=%s",
-        inferred_position + 1,
-        infra_retries,
+        "Rescheduled infrastructure interruption for %s; execution=%s continuation=%s "
+        "infra_reschedule_count=%s max_infra_retries=%s reason=%s",
         task_instance,
+        interrupted_id,
+        task_instance.id,
+        task_instance.infra_reschedule_count,
+        max_infra_retries,
         reason,
-        task_instance.max_tries,
     )
     return True
 
@@ -689,6 +714,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
     state: Mapped[str | None] = mapped_column(String(20), nullable=True)
     try_number: Mapped[int] = mapped_column(Integer, default=0)
     max_tries: Mapped[int] = mapped_column(Integer, server_default="-1")
+    infra_reschedule_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    infra_continuation_number: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     hostname: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     unixname: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     pool: Mapped[str] = mapped_column(String(256), nullable=False)
@@ -828,6 +855,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
 
         self.try_number = 0
         self.max_tries = self.task.retries
+        self.infra_reschedule_count = 0
+        self.infra_continuation_number = 0
         if not self.id:
             self.id = uuid7()
         self.unixname = getuser()
@@ -1120,13 +1149,12 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         # is the task still in the retry waiting period?
         return self.state == TaskInstanceState.UP_FOR_RETRY and not self.ready_for_retry()
 
-    def prepare_db_for_next_try(self, session: Session):
+    def prepare_db_for_next_try(self, session: Session) -> None:
         """Update the metadata with all the records needed to put this TI in queued for the next try."""
-        from airflow.models.taskinstancehistory import TaskInstanceHistory
-
-        TaskInstanceHistory.record_ti(self, session=session)
+        TaskInstanceHistory.record_ti(ti=self, session=session)
         session.execute(delete(TaskReschedule).filter_by(ti_id=self.id))
         self.id = uuid7()
+        self.infra_continuation_number = 0
 
     @provide_session
     def are_dependents_done(self, *, session: Session = NEW_SESSION) -> bool:
@@ -1942,7 +1970,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         fail_fast: bool = False,
         failure_kind: TaskFailureKind | None = None,
         reason: str | None = None,
-    ) -> TaskInstance:
+        allow_infra_continuation: bool = False,
+    ) -> TaskInstance | None:
         """
         Fetch the context needed to handle a failure.
 
@@ -1953,11 +1982,26 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         :param fail_fast: if True, fail all downstream tasks
         :param failure_kind: Known failure category, or ``None`` when unknown
         :param reason: Short producer-owned reason passed to listeners without being persisted
+        :param allow_infra_continuation: if True, an eligible infrastructure failure continues the
+            same try instead of failing it
         """
         if error:
             cls.logger().error("%s", error)
+        execution_id: UUID = ti.id
         if not test_mode:
-            ti.refresh_from_db(session=session)
+            ti.refresh_from_db(session=session, lock_for_update=True)
+
+        if ti.id != execution_id:
+            cls.logger().debug("Ignoring failure from replaced execution %s", execution_id)
+            return None
+        if failure_kind == TaskFailureKind.INFRA and ti.state in (
+            TaskInstanceState.UP_FOR_RESCHEDULE,
+            TaskInstanceState.DEFERRED,
+        ):
+            return None
+        if failure_kind is not None and ti.state in State.finished:
+            cls.logger().debug("Ignoring late failure cause for terminal task instance %s", ti)
+            return None
 
         ti.end_date = timezone.utcnow()
         ti.set_duration()
@@ -1972,11 +2016,6 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         )
         stats.incr("ti_failures", tags=failure_tags)
 
-        if not test_mode:
-            session.add(Log(TaskInstanceState.FAILED.value, ti))
-
-        ti.clear_next_method_args()
-
         # Set state correctly and figure out how to log it and decide whether
         # to email
 
@@ -1988,30 +2027,36 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         # Actual callbacks are handled by the DAG processor, not the scheduler
         task = getattr(ti, "task", None)
 
-        infra_retry_granted: bool = _maybe_use_infra_retry(
+        infra_continuation: bool = allow_infra_continuation and _reschedule_infra_failure_if_eligible(
             task_instance=ti,
             task=task,
             failure_kind=failure_kind,
+            session=session,
             reason=reason,
         )
 
-        if not infra_retry_granted and not ti.is_eligible_to_retry():
-            ti.state = TaskInstanceState.FAILED
+        if not infra_continuation:
+            if not test_mode:
+                session.add(Log(TaskInstanceState.FAILED.value, ti))
+            ti.clear_next_method_args()
 
-            if task and fail_fast:
-                _stop_remaining_tasks(task_instance=ti, session=session)
-        else:
-            if ti.state != TaskInstanceState.RESTARTING:
-                # Record the current attempt and prepare the TI for its next try.
-                # Covers every path eligible for retry reaching handle_failure():
-                # - RUNNING: task raised an exception during execution (normal failure)
-                # - QUEUED/SCHEDULED: executor killed the task externally before
-                #   it could start (e.g. pod OOMKilled in KubernetesExecutor)
-                # RESTARTING is excluded: the task was cleared via the UI/API while running;
-                # prepare_db_for_next_try() was already called during that clear operation.
-                ti.prepare_db_for_next_try(session)
+            if not ti.is_eligible_to_retry():
+                ti.state = TaskInstanceState.FAILED
 
-            ti.state = State.UP_FOR_RETRY
+                if task and fail_fast:
+                    _stop_remaining_tasks(task_instance=ti, session=session)
+            else:
+                if ti.state != TaskInstanceState.RESTARTING:
+                    # Record the current attempt and prepare the TI for its next try.
+                    # Covers every path eligible for retry reaching handle_failure():
+                    # - RUNNING: task raised an exception during execution (normal failure)
+                    # - QUEUED/SCHEDULED: executor killed the task externally before
+                    #   it could start (e.g. pod OOMKilled in KubernetesExecutor)
+                    # RESTARTING is excluded: the task was cleared via the UI/API while running;
+                    # prepare_db_for_next_try() was already called during that clear operation.
+                    ti.prepare_db_for_next_try(session)
+
+                ti.state = State.UP_FOR_RETRY
 
         try:
             get_listener_manager().hook.on_task_instance_failed(
@@ -2043,6 +2088,7 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         session: Session = NEW_SESSION,
         failure_kind: TaskFailureKind | None = None,
         reason: str | None = None,
+        allow_infra_continuation: bool = False,
     ) -> None:
         """
         Handle Failure for a task instance.
@@ -2052,6 +2098,8 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         :param session: SQLAlchemy ORM Session
         :param failure_kind: Known failure category forwarded to listeners and metrics
         :param reason: Short producer-owned reason passed to listeners without being persisted
+        :param allow_infra_continuation: if True, an eligible infrastructure failure continues the
+            same try instead of failing it
         """
         if TYPE_CHECKING:
             assert self.task
@@ -2070,7 +2118,10 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
             fail_fast=fail_fast,
             failure_kind=failure_kind,
             reason=reason,
+            allow_infra_continuation=allow_infra_continuation,
         )
+        if ti is None:
+            return
 
         _log_state(task_instance=self)
 

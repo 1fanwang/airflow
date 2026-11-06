@@ -2634,6 +2634,8 @@ class TestTaskInstance:
             "context_carrier": {},
             "retry_delay_override": 60.0,
             "retry_reason": "Rate limit, backing off",
+            "infra_reschedule_count": 2,
+            "infra_continuation_number": 2,
         }
         # Make sure we aren't missing any new value in our expected_values list.
         expected_keys = {f"task_instance.{key}" for key in expected_values}

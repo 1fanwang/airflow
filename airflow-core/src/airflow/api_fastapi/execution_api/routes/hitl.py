@@ -24,12 +24,12 @@ from fastapi import HTTPException, Security, status
 from sqlalchemy import select
 
 from airflow._shared.timezones import timezone
-from airflow.api_fastapi.common.db.common import SessionDep
 from airflow.api_fastapi.execution_api.datamodels.hitl import (
     HITLDetailRequest,
     HITLDetailResponse,
     UpdateHITLDetailPayload,
 )
+from airflow.api_fastapi.execution_api.deps import SessionDep
 from airflow.api_fastapi.execution_api.security import ExecutionAPIRoute, require_auth
 from airflow.models.hitl import HITLDetail
 

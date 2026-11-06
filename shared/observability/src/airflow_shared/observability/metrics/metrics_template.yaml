@@ -95,16 +95,16 @@ metrics:
     name_variables: []
 
   - name: "ti_infra_retry_granted"
-    description: "Replacement attempts granted for confirmed infrastructure failures.
+    description: "Same-try continuations granted for confirmed infrastructure interruptions.
     Disabled policies and non-infrastructure failures do not increment this counter."
     type: "counter"
     legacy_name: "-"
     name_variables: []
 
   - name: "ti_infra_retry_denied"
-    description: "Confirmed running infrastructure failures refused a replacement by the enabled policy's
-    current inferred ceiling. Ordinary retries may remain, and an early refusal can change after retry-setting
-    edits. Disabled policies and non-infrastructure failures do not increment this counter."
+    description: "Confirmed running infrastructure interruptions refused a continuation because the task
+    instance used its allowance. Ordinary retries may remain. Disabled policies and non-infrastructure
+    failures do not increment this counter."
     type: "counter"
     legacy_name: "-"
     name_variables: []

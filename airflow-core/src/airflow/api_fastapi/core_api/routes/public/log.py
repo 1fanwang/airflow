@@ -41,6 +41,7 @@ from airflow.exceptions import TaskNotFound
 from airflow.models import TaskInstance, Trigger
 from airflow.models.taskinstancehistory import TaskInstanceHistory
 from airflow.utils.log.log_reader import TaskLogReader
+from airflow.utils.state import TaskInstanceState
 
 _NDJSON_BATCH_SIZE = conf.getint("api", "log_stream_buffer_size")
 
@@ -137,7 +138,7 @@ def get_log(
         .options(joinedload(TaskInstance.dag_model))
     )
     ti = session.scalar(query)
-    if ti is None:
+    if ti is None or ti.state == TaskInstanceState.UP_FOR_RETRY:
         query = (
             select(TaskInstanceHistory)
             .where(
@@ -147,10 +148,12 @@ def get_log(
                 TaskInstanceHistory.map_index == map_index,
                 TaskInstanceHistory.try_number == try_number,
             )
+            .order_by(TaskInstanceHistory.infra_continuation_number.desc())
+            .limit(1)
             .options(joinedload(TaskInstanceHistory.dag_run))
             # we need to joinedload the dag_run, since FileTaskHandler._render_filename needs ti.dag_run
         )
-        ti = session.scalar(query)
+        ti = session.scalar(query) or ti
 
     if ti is None:
         metadata["end_of_log"] = True

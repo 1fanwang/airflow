@@ -68,6 +68,7 @@ from airflow.configuration import conf
 from airflow.dag_processing.bundles.base import BundleUsageTrackingManager
 from airflow.exceptions import DagNotFound
 from airflow.executors import workloads
+from airflow.executors.base_executor import TaskInstanceEvent
 from airflow.executors.executor_loader import ExecutorLoader
 from airflow.jobs.base_job_runner import BaseJobRunner
 from airflow.jobs.job import Job, JobState, perform_heartbeat
@@ -108,6 +109,7 @@ from airflow.models.log import resolve_team_name
 from airflow.models.pool import normalize_pool_name_for_stats
 from airflow.models.serialized_dag import SerializedDagModel
 from airflow.models.taskinstance import TaskInstance
+from airflow.models.taskinstancehistory import TaskInstanceHistory
 from airflow.models.taskinstancekey import TaskInstanceKey
 from airflow.models.team import Team
 from airflow.models.trigger import TRIGGER_FAIL_REPR, Trigger, TriggerFailureReason, handle_event_submit
@@ -157,6 +159,12 @@ DM = DagModel
 
 TASK_STUCK_IN_QUEUED_RESCHEDULE_EVENT = "stuck in queued reschedule"
 """:meta private:"""
+
+# RESTARTING belongs here because KubernetesExecutor reports the database state, not the pod result,
+# when a cleared worker pod exits cleanly.
+_CLEARED_EXECUTION_COMPLETION_STATES: frozenset[TaskInstanceState] = frozenset(
+    {TaskInstanceState.SUCCESS, TaskInstanceState.FAILED, TaskInstanceState.RESTARTING}
+)
 
 SCHEDULER_DAG_CACHE_SIZE = 512
 """
@@ -1518,11 +1526,45 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     job_id,
                 )
             state, info = event_buffer.pop(buffer_key)
-            failure_info: tuple[TaskFailureKind | None, str | None] = failure_info_by_key.pop(
+            failure_info: tuple[TaskFailureKind | None, str | None] | None = failure_info_by_key.pop(
                 buffer_key, None
-            ) or (None, None)
-            failure_kind: TaskFailureKind | None = failure_info[0]
-            reason: str | None = failure_info[1]
+            )
+            failure_kind: TaskFailureKind | None = (
+                failure_info[0] if failure_info is not None and state == TaskInstanceState.FAILED else None
+            )
+            reason: str | None = failure_info[1] if failure_info is not None else None
+            event_execution_id: UUID | None = None
+            if isinstance(info, TaskInstanceEvent):
+                event_execution_id = info.task_instance_id
+                info = info.info
+            cleared_execution: bool = False
+            if (
+                event_execution_id is not None
+                and event_execution_id != ti.id
+                and ti.state == TaskInstanceState.RESTARTING
+                and state in _CLEARED_EXECUTION_COMPLETION_STATES
+            ):
+                cleared_execution = (
+                    session.scalar(
+                        select(TaskInstanceHistory.task_instance_id).where(
+                            TaskInstanceHistory.task_instance_id == event_execution_id,
+                            TaskInstanceHistory.dag_id == ti.dag_id,
+                            TaskInstanceHistory.task_id == ti.task_id,
+                            TaskInstanceHistory.run_id == ti.run_id,
+                            TaskInstanceHistory.map_index == ti.map_index,
+                            TaskInstanceHistory.try_number == ti.try_number,
+                            TaskInstanceHistory.state == TaskInstanceState.FAILED,
+                        )
+                    )
+                    is not None
+                )
+            if (
+                ti.try_number != try_number
+                or (event_execution_id is not None and event_execution_id != ti.id and not cleared_execution)
+                or (event_execution_id is None and ti.infra_continuation_number > 0)
+            ):
+                cls.logger().debug("Ignoring stale or unidentified executor event for %s", ti)
+                continue
 
             if state in (TaskInstanceState.QUEUED, TaskInstanceState.RUNNING):
                 ti.external_executor_id = info
@@ -1646,8 +1688,11 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     session=session,
                     failure_kind=failure_kind,
                     reason=reason,
+                    allow_infra_continuation=event_execution_id is not None and not cleared_execution,
                 )
-                final_state: TaskInstanceState = cast("TaskInstanceState", ti.state)
+                final_state: TaskInstanceState = TaskInstanceState(ti.state)
+                if final_state == TaskInstanceState.UP_FOR_RESCHEDULE:
+                    continue
 
                 if task.has_on_retry_callback or task.has_on_failure_callback:
                     # Only log the error/extra info here, since the `ti.handle_failure()` path will log it
@@ -3306,7 +3351,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                         executor.send_callback(request)
             finally:
                 ti.set_state(TaskInstanceState.FAILED, session=session)
-                executor.fail(ti.key)
+                executor.fail(key=ti.key, info=TaskInstanceEvent(task_instance_id=ti.id))
 
     def _reschedule_stuck_task(self, ti: TaskInstance, session: Session):
         filter_for_tis = TI.filter_for_tis([ti])
@@ -3890,6 +3935,9 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     )
                 )
 
+            # handle_failure() moves a retried TI to a new execution ID, so capture this one first
+            # to mark the executor event below as stale.
+            execution_id: UUID = ti.id
             ti.handle_failure(error=msg, session=session)
             executor = self._try_to_load_executor(
                 ti, session, team_name=dag_id_to_team_name.get(ti.dag_id, NOTSET)
@@ -3901,7 +3949,12 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     ti.executor,
                 )
                 continue
-            executor.change_state(ti.key, TaskInstanceState.FAILED, remove_running=True)
+            executor.change_state(
+                key=ti.key,
+                state=TaskInstanceState.FAILED,
+                info=TaskInstanceEvent(task_instance_id=execution_id),
+                remove_running=True,
+            )
             stats.incr(
                 "task_instances_without_heartbeats_killed",
                 tags=prune_dict(

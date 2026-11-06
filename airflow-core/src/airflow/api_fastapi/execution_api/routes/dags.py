@@ -19,8 +19,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, status
 
-from airflow.api_fastapi.common.db.common import SessionDep
 from airflow.api_fastapi.execution_api.datamodels.dags import DagResponse
+from airflow.api_fastapi.execution_api.deps import SessionDep
 from airflow.models.dag import DagModel
 
 router = APIRouter()

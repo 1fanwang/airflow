@@ -72,6 +72,7 @@ def get_execution_api_server_url(conf_source: AirflowConfigParser | ExecutorConf
 if TYPE_CHECKING:
     import argparse
     from datetime import datetime
+    from uuid import UUID
 
     from sqlalchemy.orm import Session
 
@@ -126,6 +127,14 @@ class _LegacyWorkloadFlag:
     def __set__(self, obj: BaseExecutor, value: bool) -> None:
         obj._warn_legacy_property(self.name, self.deprecation_message)
         obj._set_workload_type_supported(self.workload_type, value)
+
+
+@dataclass(frozen=True)
+class TaskInstanceEvent:
+    """Bind an executor result to the UUID supplied to that execution."""
+
+    task_instance_id: UUID
+    info: Any = None
 
 
 @dataclass
@@ -311,6 +320,7 @@ class BaseExecutor(LoggingMixin):
         )
         self.running: set[WorkloadKey] = set()
         self.event_buffer: dict[WorkloadKey, EventBufferValueType] = {}
+        self._task_instance_ids: dict[WorkloadKey, tuple[UUID, bool]] = {}
         self._task_failure_info: dict[WorkloadKey, tuple[TaskFailureKind | None, str | None]] = {}
         self._task_event_logs: deque[Log] = deque()
         self.conf = ExecutorConf(team_name)
@@ -395,6 +405,11 @@ class BaseExecutor(LoggingMixin):
                 f"{type(self).__name__} does not support {workload.type.value} workloads. "
                 f"Add WorkloadType.{workload.type.name} to supported_workload_types and implement handling "
                 f"in _process_workloads()."
+            )
+        if isinstance(workload, ExecuteTask):
+            self._task_instance_ids[workload.ti.key] = (
+                workload.ti.id,
+                workload.ti.infra_continuation_number > 0,
             )
         self.executor_queues[workload.type][workload.key] = workload
 
@@ -570,6 +585,14 @@ class BaseExecutor(LoggingMixin):
         )
         return self._get_workloads_to_schedule(self.parallelism - len(self.running))
 
+    def _is_stale_task_event(self, key: WorkloadKey, info: Any) -> bool:
+        execution: tuple[UUID, bool] | None = self._task_instance_ids.get(key)
+        if execution is None:
+            return False
+        if isinstance(info, TaskInstanceEvent):
+            return info.task_instance_id != execution[0]
+        return execution[1]
+
     # TODO: This should not be using `TaskInstanceState` here, this is just "did the process complete, or did
     # it die". It is possible for the task itself to finish with success, but the state of the task to be set
     # to FAILED. By using TaskInstanceState enum here it confuses matters!
@@ -584,6 +607,9 @@ class BaseExecutor(LoggingMixin):
         :param info: Executor information for the task instance
         :param remove_running: Whether or not to remove the TI key from running set
         """
+        if self._is_stale_task_event(key=key, info=info):
+            self.log.debug("Ignoring event from a replaced execution: %s", key)
+            return
         self.log.debug("Changing state: %s", key)
         if remove_running:
             try:
@@ -600,6 +626,7 @@ class BaseExecutor(LoggingMixin):
         *,
         failure_kind: TaskFailureKind | None = None,
         reason: str | None = None,
+        task_instance_id: UUID | None = None,
     ) -> None:
         """
         Set fail state for the event.
@@ -608,7 +635,12 @@ class BaseExecutor(LoggingMixin):
         :param key: Unique key for the task instance
         :param failure_kind: Cause of the failure, when the executor can identify it
         :param reason: Short executor-owned reason token, with or without a failure kind
+        :param task_instance_id: UUID of the execution that failed, used to drop late events
         """
+        if task_instance_id is not None:
+            info = TaskInstanceEvent(task_instance_id=task_instance_id, info=info)
+        if self._is_stale_task_event(key=key, info=info):
+            return
         self.change_state(key=key, state=state_class_for_key(key).FAILED, info=info)
         if failure_kind is not None or reason is not None:
             self._task_failure_info[key] = failure_kind, reason
@@ -660,6 +692,9 @@ class BaseExecutor(LoggingMixin):
                 if not isinstance(key, TaskInstanceKey) or key.dag_id in dag_ids:
                     cleared_events[key] = self.event_buffer.pop(key)
 
+        for key in cleared_events:
+            if key not in self.running and key not in self.executor_queues[WorkloadType.EXECUTE_TASK]:
+                self._task_instance_ids.pop(key, None)
         return cleared_events
 
     def get_task_failure_info(self, key: WorkloadKey) -> tuple[TaskFailureKind | None, str | None] | None:

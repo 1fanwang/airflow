@@ -37,12 +37,12 @@ from fastapi import HTTPException, Query, status
 from sqlalchemy import select
 
 from airflow._shared.state import AssetScope, AssetStateStoreWriterKind
-from airflow.api_fastapi.common.db.common import SessionDep
 from airflow.api_fastapi.execution_api.datamodels.asset_state_store import (
     AssetStateStorePutBody,
     AssetStateStoreResponse,
 )
 from airflow.api_fastapi.execution_api.datamodels.token import TIToken
+from airflow.api_fastapi.execution_api.deps import SessionDep
 from airflow.api_fastapi.execution_api.security import CurrentTIToken, ExecutionAPIRoute
 from airflow.models.asset import AssetModel
 from airflow.models.taskinstance import TaskInstance

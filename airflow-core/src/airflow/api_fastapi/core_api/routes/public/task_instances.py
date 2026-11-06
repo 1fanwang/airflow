@@ -387,7 +387,11 @@ def get_task_instance_tries(
     tis = session.scalars(
         _query(TI).where(or_(TI.state != TaskInstanceState.UP_FOR_RETRY, TI.state.is_(None)))
     ).all()
-    task_instances = list(session.scalars(_query(TIH)).all()) + list(tis)
+    task_instances = list(
+        session.scalars(
+            _query(TIH).where(or_(TIH.state != TaskInstanceState.UP_FOR_RESCHEDULE, TIH.state.is_(None)))
+        ).all()
+    ) + list(tis)
 
     if not task_instances:
         raise HTTPException(
@@ -811,8 +815,10 @@ def get_task_instance_try_details(
             orm_object.try_number == task_try_number,
             orm_object.map_index == map_index,
         )
+        if orm_object is TIH:
+            query = query.order_by(TIH.infra_continuation_number.desc())
 
-        ti_or_tih = session.scalar(query)
+        ti_or_tih = session.scalar(query.limit(1))
         return ti_or_tih
 
     ti_or_tih = _query(TI) or _query(TIH)

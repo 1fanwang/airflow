@@ -22,8 +22,8 @@ from uuid import UUID
 from fastapi import APIRouter, Security, status
 from sqlalchemy import select
 
-from airflow.api_fastapi.common.db.common import SessionDep
 from airflow.api_fastapi.common.types import UtcDateTime
+from airflow.api_fastapi.execution_api.deps import SessionDep
 from airflow.api_fastapi.execution_api.security import require_auth
 from airflow.models.taskreschedule import TaskReschedule
 

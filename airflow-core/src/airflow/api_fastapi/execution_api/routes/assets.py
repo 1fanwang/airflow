@@ -22,8 +22,8 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import select
 
-from airflow.api_fastapi.common.db.common import SessionDep
 from airflow.api_fastapi.execution_api.datamodels.asset import AssetResponse
+from airflow.api_fastapi.execution_api.deps import SessionDep
 from airflow.models.asset import AssetModel, expand_alias_to_assets
 
 router = APIRouter(

@@ -44,7 +44,7 @@ from airflow._shared.observability.traces import override_ids
 from airflow._shared.state import TaskScope
 from airflow._shared.timezones import timezone
 from airflow.api_fastapi.common.dagbag import DagBagDep, get_latest_version_of_dag
-from airflow.api_fastapi.common.db.common import AsyncSessionDep, SessionDep
+from airflow.api_fastapi.common.db.common import AsyncSessionDep
 from airflow.api_fastapi.common.db.dags import eager_load_teams
 from airflow.api_fastapi.common.types import UtcDateTime
 from airflow.api_fastapi.compat import HTTP_422_UNPROCESSABLE_CONTENT
@@ -69,7 +69,7 @@ from airflow.api_fastapi.execution_api.datamodels.taskinstance import (
     TITerminalStatePayload,
 )
 from airflow.api_fastapi.execution_api.datamodels.token import TIToken
-from airflow.api_fastapi.execution_api.deps import DepContainer
+from airflow.api_fastapi.execution_api.deps import DepContainer, SessionDep
 from airflow.api_fastapi.execution_api.security import (
     CurrentTIToken,
     ExecutionAPIRoute,

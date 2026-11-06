@@ -22,7 +22,6 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import and_, select
 
-from airflow.api_fastapi.common.db.common import SessionDep
 from airflow.api_fastapi.common.parameters import (
     BaseParam,
     QueryAssetEventPartitionKeyFilter,
@@ -34,6 +33,7 @@ from airflow.api_fastapi.execution_api.datamodels.asset_event import (
     AssetEventResponse,
     AssetEventsResponse,
 )
+from airflow.api_fastapi.execution_api.deps import SessionDep
 from airflow.models.asset import AssetAliasModel, AssetEvent, AssetModel
 from airflow.utils.sqlalchemy import JsonContains
 

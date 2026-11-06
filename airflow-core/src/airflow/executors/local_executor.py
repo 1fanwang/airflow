@@ -36,8 +36,13 @@ from typing import TYPE_CHECKING
 
 import structlog
 
-from airflow.executors.base_executor import BaseExecutor, get_execution_api_server_url
+from airflow.executors.base_executor import (
+    BaseExecutor,
+    TaskInstanceEvent,
+    get_execution_api_server_url,
+)
 from airflow.executors.workloads import WorkloadType
+from airflow.executors.workloads.task import ExecuteTask
 
 # add logger to parameter of setproctitle to support logging
 if sys.platform == "darwin":
@@ -107,10 +112,18 @@ def _run_worker(
                 proctitle=f"{_get_executor_process_title_prefix(team_conf.team_name)} {workload.display_name}",
                 subprocess_logs_to_stdout=True,
             )
-            output.put((workload.key, workload.success_state, None))
+            output.put((workload.key, workload.success_state, _result_info(workload=workload)))
         except Exception as e:
             log.exception("Workload execution failed.", workload_type=type(workload).__name__)
-            output.put((workload.key, workload.failure_state, e))
+            output.put((workload.key, workload.failure_state, _result_info(workload=workload, info=e)))
+
+
+def _result_info(
+    *, workload: ExecutorWorkload, info: Exception | None = None
+) -> Exception | TaskInstanceEvent | None:
+    if isinstance(workload, ExecuteTask):
+        return TaskInstanceEvent(task_instance_id=workload.ti.id, info=info)
+    return info
 
 
 class LocalExecutor(BaseExecutor):
@@ -251,7 +264,11 @@ class LocalExecutor(BaseExecutor):
         try:
             while not self.result_queue.empty():
                 key, state, exc = self.result_queue.get()
-                self.change_state(key, state)
+                self.change_state(
+                    key=key,
+                    state=state,
+                    info=exc if isinstance(exc, TaskInstanceEvent) else None,
+                )
         except (OSError, EOFError):
             self.log.exception("Error reading from result queue")
 

@@ -39,7 +39,7 @@ from typing_extensions import NotRequired
 
 from airflow.configuration import conf
 from airflow.executors.executor_loader import ExecutorLoader
-from airflow.utils.helpers import parse_template_string, render_template
+from airflow.utils.helpers import _log_filename_for_continuation, parse_template_string, render_template
 from airflow.utils.log.log_stream_accumulator import LogStreamAccumulator
 from airflow.utils.log.logging_mixin import SetContextPropagate
 from airflow.utils.log.non_caching_file_handler import NonCachingRotatingFileHandler
@@ -106,6 +106,7 @@ class LogMetadata(TypedDict):
 
     end_of_log: bool
     log_pos: NotRequired[int]
+    infra_segments: NotRequired[dict[str, LogMetadata]]
     # the following attributes are used for Elasticsearch and OpenSearch log handlers
     offset: NotRequired[str | int]
     # Ensure a string here. Large offset numbers will get JSON.parsed incorrectly
@@ -396,7 +397,7 @@ def _interleave_logs(*log_streams: RawLogStream) -> StructuredLogStream:
     del parsed_log_streams
 
 
-def _is_logs_stream_like(log) -> bool:
+def _is_logs_stream_like(log: object) -> bool:
     """Check if the logs are stream-like."""
     return isinstance(log, (chain, islice, GeneratorType))
 
@@ -531,12 +532,12 @@ class FileTaskHandler(logging.Handler):
 
         template = dag_run.get_log_template(session=session).filename
         str_tpl, jinja_tpl = parse_template_string(template)
+        filename: str
         if jinja_tpl:
-            return render_template(
+            filename = render_template(
                 jinja_tpl, {"ti": ti, "ts": formatted_date, "try_number": try_number}, native=False
             )
-
-        if str_tpl:
+        elif str_tpl:
             data_interval = (dag_run.data_interval_start, dag_run.data_interval_end)
             if data_interval[0]:
                 data_interval_start = data_interval[0].isoformat()
@@ -546,7 +547,7 @@ class FileTaskHandler(logging.Handler):
                 data_interval_end = data_interval[1].isoformat()
             else:
                 data_interval_end = ""
-            return str_tpl.format(
+            filename = str_tpl.format(
                 dag_id=ti.dag_id,
                 task_id=ti.task_id,
                 run_id=ti.run_id,
@@ -555,7 +556,13 @@ class FileTaskHandler(logging.Handler):
                 logical_date=formatted_date,
                 try_number=try_number,
             )
-        raise RuntimeError(f"Unable to render log filename for {ti}. This should never happen")
+        else:
+            raise RuntimeError(f"Unable to render log filename for {ti}. This should never happen")
+        return _log_filename_for_continuation(
+            filename=filename,
+            continuation_number=getattr(ti, "infra_continuation_number", 0),
+            execution_id=getattr(ti, "id", None),
+        )
 
     def _get_executor(self, ti: TaskInstance | TaskInstanceHistory) -> BaseExecutor:
         """

@@ -50,7 +50,12 @@ class TaskReschedule(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     ti_id: Mapped[UUID] = mapped_column(
         Uuid(),
-        ForeignKey("task_instance.id", ondelete="CASCADE", name="task_reschedule_ti_fkey"),
+        ForeignKey(
+            "task_instance.id",
+            ondelete="CASCADE",
+            onupdate="CASCADE",
+            name="task_reschedule_ti_fkey",
+        ),
         nullable=False,
     )
     start_date: Mapped[datetime.datetime] = mapped_column(UtcDateTime, nullable=False)

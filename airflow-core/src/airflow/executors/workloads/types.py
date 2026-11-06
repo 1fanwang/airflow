@@ -31,8 +31,10 @@ WorkloadKey: TypeAlias = TaskInstanceKey | CallbackKey | ConnectionTestKey
 WorkloadState: TypeAlias = TaskInstanceState | CallbackState | ConnectionTestState
 
 if TYPE_CHECKING:
+    from airflow.executors.base_executor import TaskInstanceEvent
+
     # Type alias for executor workload results (used by executor implementations)
-    WorkloadResultType: TypeAlias = tuple[WorkloadKey, WorkloadState, Exception | None]
+    WorkloadResultType: TypeAlias = tuple[WorkloadKey, WorkloadState, Exception | TaskInstanceEvent | None]
 
 # Type alias for scheduler workloads (ORM models that can be routed to executors)
 # Must be outside TYPE_CHECKING for use in function signatures

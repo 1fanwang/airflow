@@ -105,8 +105,12 @@ def _get_task_instance_with_hitl_detail(
 
         if try_number is not None:
             query = query.where(orm_object.try_number == try_number)
+        if orm_object is TIH:
+            query = query.where(TIH.state != TaskInstanceState.UP_FOR_RESCHEDULE).order_by(
+                TIH.infra_continuation_number.desc()
+            )
 
-        ti_or_tih = session.scalar(query)
+        ti_or_tih = session.scalar(query.limit(1))
         return ti_or_tih
 
     if try_number is None:

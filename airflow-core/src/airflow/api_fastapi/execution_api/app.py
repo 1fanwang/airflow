@@ -391,7 +391,7 @@ class InProcessExecutionAPI:
             from airflow.api_fastapi.execution_api.routes.connections import has_connection_access
             from airflow.api_fastapi.execution_api.routes.variables import has_variable_access
             from airflow.api_fastapi.execution_api.routes.xcoms import has_xcom_access
-            from airflow.api_fastapi.execution_api.security import _jwt_bearer
+            from airflow.api_fastapi.execution_api.security import _jwt_bearer, fence_task_execution
 
             # Give this app its own lifespan + services registry so that stubbing services
             # (e.g. JWTValidator) doesn't affect the module-level ``lifespan.registry``.
@@ -416,6 +416,7 @@ class InProcessExecutionAPI:
                 return TIToken(id=ti_id, claims=claims)
 
             self._app.dependency_overrides[_jwt_bearer] = always_allow
+            self._app.dependency_overrides[fence_task_execution] = lambda: None
             self._app.dependency_overrides[has_connection_access] = always_allow
             self._app.dependency_overrides[has_variable_access] = always_allow
             self._app.dependency_overrides[has_xcom_access] = always_allow

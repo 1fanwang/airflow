@@ -18,8 +18,13 @@
 # Disable future annotations in this file to work around https://github.com/fastapi/fastapi/issues/13056
 # ruff: noqa: I002
 
+from typing import Annotated
+
 import svcs
 from fastapi import Depends, Request
+from sqlalchemy.orm import Session
+
+from airflow.api_fastapi.common.db import common
 
 
 # See https://github.com/fastapi/fastapi/issues/13056
@@ -29,3 +34,11 @@ async def _container(request: Request):
 
 
 DepContainer: svcs.Container = Depends(_container)
+
+
+def _session(request: Request, session: common.SessionDep) -> Session:
+    # Security scopes can resolve the same dependency with different cache keys.
+    return request.scope.setdefault("execution_api_session", session)
+
+
+SessionDep = Annotated[Session, Depends(_session, scope="function")]

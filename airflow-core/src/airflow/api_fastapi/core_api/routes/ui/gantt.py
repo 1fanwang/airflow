@@ -91,6 +91,7 @@ def get_gantt_data(
         TaskInstanceHistory.dag_id == dag_id,
         TaskInstanceHistory.run_id == run_id,
         TaskInstanceHistory.map_index == -1,
+        TaskInstanceHistory.state != TaskInstanceState.UP_FOR_RESCHEDULE,
     )
 
     combined = union_all(current_tis, history_tis).subquery()

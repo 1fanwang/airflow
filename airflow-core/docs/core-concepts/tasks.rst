@@ -187,31 +187,37 @@ Classification alone does not grant attempts, change retry or clear behavior, or
 Dag callback context. See :doc:`/administration-and-deployment/listeners` for consuming
 the cause through infrastructure listener hooks.
 
-Infrastructure replacement attempts
------------------------------------
+Infrastructure continuations
+----------------------------
 
-Administrators can set :ref:`config:core__max_infra_retries` to grant additional attempts when an
-executor confirms that infrastructure stopped a task. The default is ``0``, which disables
-replacement attempts. No Dag or task setting is required, including for tasks with ``retries=0``.
+Administrators can set :ref:`config:core__max_infra_retries` to continue a running task after an
+executor confirms that infrastructure interrupted it. The default is ``0``, which keeps ordinary
+retry behavior. A continuation uses native rescheduling, the task's retry delay and backoff, and
+the same visible try number. It does not increase ``max_tries``. A task with ``retries=0`` can
+continue after a covered interruption, but a later application error still fails that task.
 An unknown cause, generic worker loss, or a missed heartbeat does not qualify.
 
-The scheduler locks and refreshes the task instance before handling an executor failure. Only a
-``RUNNING`` task with a positive attempt number can receive a replacement. Queued, cleared and
-already-handled states do not produce an infrastructure policy decision. The scheduler increases
-the existing ``max_tries`` before deciding the retry state, callback, and email notification.
-For each running failure it recomputes
-``max((max_tries or 0) - (retries or 0), try_number - 1, 0)`` and grants a replacement
-only if that inferred position is below ``max_infra_retries``.
+The executor must supply infrastructure evidence tied to the current execution's UUID. Airflow
+checks the execution identity and allowance in the same database transaction, then gives the
+continuation a new UUID. Late executor events and writes from the interrupted worker cannot
+update it. Executors that do not supply execution identity retain ordinary retry handling.
+Apply the schema migration and update the scheduler, Execution API and executor components
+before enabling this policy.
 
-This is a conservative ceiling rather than a separate count of infrastructure failures. Ordinary
-attempts and task clears can consume the allowance without any infrastructure replacement. An early
-refusal can change after normal retries are edited, because ``max_tries - retries`` can decrease.
-Once ``try_number - 1`` reaches the configured cap, neither clears nor normal-retry edits can
-restore eligibility under that same cap. These persisted fields survive scheduler restarts.
-After a refusal, normal retry handling still applies.
+The allowance is per task instance within a Dag run. A database counter survives worker changes,
+scheduler restarts and ordinary retries. An explicit manual clear resets it; retry-setting edits
+do not. An exhausted allowance falls back to ordinary retry eligibility. The interrupted
+execution remains in task instance history as a rescheduled segment rather than a failed try.
+File-backed logs use a separate file per continuation, and the log reader shows the execution
+boundaries. Elasticsearch and OpenSearch keep one log stream for the whole visible try.
 
-``ti_infra_retry_granted`` counts granted replacements, and ``ti_infra_retry_denied`` counts
-confirmed running infrastructure failures refused by the enabled policy's current ceiling. Neither
+Continuations execute the operator normally. The operator must reattach to any external job
+using the :doc:`task state store <task-and-asset-state-store>` or its own recovery mechanism.
+Execution timeouts keep their per-execution semantics. Covered continuations do not send
+failure or retry callbacks or emails.
+
+``ti_infra_retry_granted`` counts granted continuations, and ``ti_infra_retry_denied`` counts
+confirmed running infrastructure failures refused because the allowance is exhausted. Neither
 increments when the policy is disabled or the cause is not infrastructure. These named counters
 also work with classic StatsD and use the existing task metric tags on tagged backends.
 

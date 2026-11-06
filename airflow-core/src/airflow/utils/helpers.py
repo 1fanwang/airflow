@@ -34,6 +34,7 @@ from airflow.serialization.definitions.notset import is_arg_set
 
 if TYPE_CHECKING:
     from datetime import datetime
+    from uuid import UUID
 
     import jinja2
     from typing_extensions import TypeIs
@@ -148,17 +149,31 @@ def log_filename_template_renderer() -> Callable[..., str]:
     if "{{" in template:
         import jinja2
 
-        return jinja2.Template(template).render
+        render = jinja2.Template(template).render
+    else:
 
-    def f_str_format(ti: TaskInstance, try_number: int | None = None):
-        return template.format(
-            dag_id=ti.dag_id,
-            task_id=ti.task_id,
-            logical_date=ti.logical_date.isoformat(),
-            try_number=try_number or ti.try_number,
+        def render(ti: TaskInstance, try_number: int | None = None) -> str:
+            return template.format(
+                dag_id=ti.dag_id,
+                task_id=ti.task_id,
+                logical_date=ti.logical_date.isoformat(),
+                try_number=try_number or ti.try_number,
+            )
+
+    def render_filename(**context: Any) -> str:
+        return _log_filename_for_continuation(
+            filename=render(**context),
+            continuation_number=getattr(context["ti"], "infra_continuation_number", 0),
+            execution_id=getattr(context["ti"], "id", None),
         )
 
-    return f_str_format
+    return render_filename
+
+
+def _log_filename_for_continuation(
+    *, filename: str, continuation_number: int, execution_id: UUID | None
+) -> str:
+    return f"continuations/{execution_id}/{filename}" if continuation_number else filename
 
 
 def convert_camel_to_snake(camel_str: str) -> str:

@@ -22,18 +22,24 @@ import time
 from collections.abc import Generator, Iterator
 from datetime import datetime, timezone
 from functools import cached_property
+from itertools import chain
 from typing import TYPE_CHECKING
 
+from sqlalchemy import select
+from sqlalchemy.orm import joinedload
+
 from airflow.configuration import conf
+from airflow.logging_config import get_remote_task_log
+from airflow.models.taskinstancehistory import TaskInstanceHistory
 from airflow.utils.log.file_task_handler import FileTaskHandler, StructuredLogMessage
 from airflow.utils.log.logging_mixin import ExternalLoggingMixin
+from airflow.utils.session import create_session
 from airflow.utils.state import TaskInstanceState
 
 if TYPE_CHECKING:
     from typing import TypeAlias
 
     from airflow.models.taskinstance import TaskInstance
-    from airflow.models.taskinstancehistory import TaskInstanceHistory
     from airflow.utils.log.file_task_handler import LogHandlerOutputStream, LogMetadata
 
 LogReaderOutputStream: TypeAlias = Generator[str, None, None]
@@ -96,7 +102,66 @@ class TaskLogReader:
             # one message + tell the caller it's the end so stream stops
             return msg, {"end_of_log": True}
 
-        return self.log_handler.read(ti, try_number, metadata=metadata)
+        if (
+            not (getattr(ti, "infra_continuation_number", 0) or getattr(ti, "infra_reschedule_count", 0))
+            or getattr(self.log_handler, "_reads_entire_task_try", False)
+            or (
+                isinstance(self.log_handler, FileTaskHandler)
+                and getattr(get_remote_task_log(), "_reads_entire_task_try", False)
+            )
+        ):
+            return self.log_handler.read(ti, try_number, metadata=metadata)
+
+        with create_session() as session:
+            segments = list(
+                session.scalars(
+                    select(TaskInstanceHistory)
+                    .where(
+                        TaskInstanceHistory.dag_id == ti.dag_id,
+                        TaskInstanceHistory.task_id == ti.task_id,
+                        TaskInstanceHistory.run_id == ti.run_id,
+                        TaskInstanceHistory.map_index == ti.map_index,
+                        TaskInstanceHistory.try_number == (try_number or ti.try_number),
+                    )
+                    .order_by(TaskInstanceHistory.infra_continuation_number)
+                    .options(joinedload(TaskInstanceHistory.dag_run))
+                )
+            )
+        if ti.id not in {segment.id for segment in segments} and ti.state != TaskInstanceState.UP_FOR_RETRY:
+            segments.append(ti)
+        if len(segments) < 2:
+            return self.log_handler.read(
+                ti, try_number, metadata=metadata.get("infra_segments", {}).get(str(ti.id), metadata)
+            )
+
+        streams: list[LogHandlerOutputStream] = []
+        segment_metadata: dict[str, LogMetadata] = {}
+        for segment in segments:
+            execution_id = str(segment.id)
+            previous_metadata: LogMetadata | None = metadata.get("infra_segments", {}).get(execution_id)
+            if (
+                "infra_segments" not in metadata
+                and segment.infra_continuation_number == 0
+                and ("log_pos" in metadata or "offset" in metadata)
+            ):
+                previous_metadata = metadata
+            if not previous_metadata:
+                streams.append(
+                    iter(
+                        [
+                            StructuredLogMessage(
+                                event=f"Execution {execution_id}, continuation {segment.infra_continuation_number}"
+                            )
+                        ]
+                    )
+                )
+            stream, next_metadata = self.log_handler.read(segment, try_number, metadata=previous_metadata)
+            streams.append(stream)
+            segment_metadata[execution_id] = next_metadata
+        return chain.from_iterable(streams), {
+            "end_of_log": next_metadata["end_of_log"],
+            "infra_segments": segment_metadata,
+        }
 
     def read_log_stream(
         self,
@@ -120,7 +185,7 @@ class TaskLogReader:
                 yield f"{msg.model_dump_json()}\n"
             return
 
-        for key in ("end_of_log", "max_offset", "offset", "log_pos"):
+        for key in ("end_of_log", "max_offset", "offset", "log_pos", "infra_segments"):
             # https://mypy.readthedocs.io/en/stable/typed_dict.html#supported-operations
             metadata.pop(key, None)  # type: ignore[misc]
         empty_iterations = 0

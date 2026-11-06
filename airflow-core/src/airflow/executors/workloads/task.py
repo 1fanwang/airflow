@@ -38,9 +38,11 @@ class TaskInstanceDTO(TaskInstance):
     The versioned execution API ``TaskInstance`` schema plus executor-only fields.
 
     The base class is the single source of truth for the fields a worker needs;
-    the fields added here are executor concerns (queueing order and pool
-    accounting) the worker never reads.
+    the fields added here are executor concerns (queueing order, pool
+    accounting and continuation tracking) the worker never reads.
     """
+
+    infra_continuation_number: int = Field(default=0, exclude=True)
 
     pool_slots: int
     priority_weight: int

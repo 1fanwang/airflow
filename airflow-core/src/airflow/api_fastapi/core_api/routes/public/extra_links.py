@@ -101,13 +101,16 @@ def get_extra_links(
     # which also validates that the requested try_number actually exists.
     if try_number is not None and try_number != ti.try_number:
         tih = session.scalar(
-            select(TaskInstanceHistory).where(
+            select(TaskInstanceHistory)
+            .where(
                 TaskInstanceHistory.dag_id == dag_id,
                 TaskInstanceHistory.task_id == task_id,
                 TaskInstanceHistory.run_id == dag_run_id,
                 TaskInstanceHistory.map_index == map_index,
                 TaskInstanceHistory.try_number == try_number,
             )
+            .order_by(TaskInstanceHistory.infra_continuation_number.desc())
+            .limit(1)
         )
         if not tih:
             raise HTTPException(

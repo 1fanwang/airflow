@@ -25,11 +25,11 @@ from fastapi import HTTPException, Path, Security, status
 from sqlalchemy.orm import Session
 
 from airflow._shared.state import TaskScope
-from airflow.api_fastapi.common.db.common import SessionDep
 from airflow.api_fastapi.execution_api.datamodels.task_state_store import (
     TaskStateStorePutBody,
     TaskStateStoreResponse,
 )
+from airflow.api_fastapi.execution_api.deps import SessionDep
 from airflow.api_fastapi.execution_api.security import ExecutionAPIRoute, require_auth
 from airflow.models.taskinstance import TaskInstance as TI
 from airflow.state import get_state_backend
