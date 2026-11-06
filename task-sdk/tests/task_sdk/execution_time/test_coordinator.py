@@ -385,8 +385,16 @@ class TestPythonCoordinatorWarmShutdown:
         original_term = signal.getsignal(signal.SIGTERM)
         captured: dict[str, object] = {}
 
+        def _route_handler(signum, frame):
+            pass
+
         class _FakeProcess:
             final_state = "success"
+
+            def route_worker_sigterm(self_inner):
+                captured["before_route"] = signal.getsignal(signal.SIGTERM)
+                previous = signal.signal(signal.SIGTERM, _route_handler)
+                return lambda: signal.signal(signal.SIGTERM, previous)
 
             def wait(self_inner):
                 captured["wait"] = signal.getsignal(signal.SIGTERM)
@@ -411,10 +419,10 @@ class TestPythonCoordinatorWarmShutdown:
 
         assert result.exit_code == 0
         assert result.final_state == "success"
-        # During both start() and wait() a warm-shutdown handler was installed...
+        # start() runs under the warm-shutdown handler; wait() under the worker SIGTERM route...
         assert callable(captured["start"])
-        assert callable(captured["wait"])
         assert captured["start"] is not original_term
-        assert captured["start"] is captured["wait"]
+        assert captured["before_route"] is captured["start"]
+        assert captured["wait"] is _route_handler
         # ...and the original disposition is restored once execute_task returns.
         assert signal.getsignal(signal.SIGTERM) is original_term

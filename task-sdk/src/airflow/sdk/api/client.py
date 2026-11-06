@@ -74,6 +74,8 @@ from airflow.sdk.api.datamodels._generated import (
     TIDeferredStatePayload,
     TIEnterRunningPayload,
     TIHeartbeatInfo,
+    TIInterruptPayload,
+    TIInterruptResponse,
     TIRescheduleStatePayload,
     TIRetryStatePayload,
     TIRunContext,
@@ -330,6 +332,12 @@ class TaskInstanceOperations:
     def heartbeat(self, id: uuid.UUID, pid: int):
         body = TIHeartbeatInfo(pid=pid, hostname=get_hostname())
         self.client.put(f"task-instances/{id}/heartbeat", content=body.model_dump_json())
+
+    def interrupt(self, id: uuid.UUID, reason: str) -> str | None:
+        """Report that the worker's platform is stopping it; returns the task instance state the server chose."""
+        body = TIInterruptPayload(reason=reason)
+        resp = self.client.post(f"task-instances/{id}/interrupt", content=body.model_dump_json())
+        return TIInterruptResponse.model_validate_json(resp.read()).state
 
     def skip_downstream_tasks(self, id: uuid.UUID, msg: SkipDownstreamTasks):
         """Tell the API server to skip the downstream tasks of this TI."""

@@ -52,7 +52,7 @@ from airflow.sdk._shared.module_loading import import_string
 from airflow.sdk.configuration import conf
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Mapping
+    from collections.abc import Callable, Generator, Mapping
     from os import PathLike
 
     from structlog.typing import FilteringBoundLogger
@@ -193,7 +193,11 @@ class _PythonCoordinator(BaseCoordinator):
                 subprocess_logs_to_stdout=subprocess_logs_to_stdout,
                 sentry_integration=sentry_integration,
             )
-            exit_code = process.wait()
+            restore_sigterm: Callable[[], None] = process.route_worker_sigterm()
+            try:
+                exit_code = process.wait()
+            finally:
+                restore_sigterm()
             return self.ExecutionResult(exit_code, process.final_state)
 
 

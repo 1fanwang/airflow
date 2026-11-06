@@ -272,6 +272,18 @@ class TIHeartbeatInfo(StrictBaseModel):
     pid: int
 
 
+class TIInterruptPayload(StrictBaseModel):
+    """Schema for reporting that a worker's platform is stopping it."""
+
+    reason: Annotated[str, Field(max_length=200)]
+
+
+class TIInterruptResponse(BaseModel):
+    """Task instance state chosen after a worker interruption."""
+
+    state: str | None
+
+
 # This model is not used in the API, but it is included in generated OpenAPI schema
 # for use in the client SDKs.
 class TaskInstance(BaseModel):

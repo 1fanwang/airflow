@@ -167,6 +167,8 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 _trace_propagator = TraceContextTextMapPropagator()
 
 if TYPE_CHECKING:
+    from types import FrameType
+
     from structlog.typing import FilteringBoundLogger, WrappedLogger
     from typing_extensions import Self
 
@@ -191,6 +193,9 @@ SOCKET_CLEANUP_TIMEOUT: float = conf.getfloat("workers", "socket_cleanup_timeout
 TASK_OVERTIME_THRESHOLD: float = conf.getfloat("core", "task_success_overtime")
 
 SERVER_TERMINATED = "SERVER_TERMINATED"
+INFRA_CONTINUED = "INFRA_CONTINUED"
+WORKER_SIGTERM_REASON: str = "WorkerSIGTERM"
+PLATFORM_STOP_GRACE_SECONDS: float = 3.0
 
 # These are the task instance states that require some additional information to transition into.
 # "Directly" here means that the PATCH API calls to transition into these states are
@@ -203,6 +208,7 @@ STATES_SENT_DIRECTLY: frozenset[TaskInstanceState | str] = frozenset(
         TaskInstanceState.UP_FOR_RETRY,
         TaskInstanceState.SUCCESS,
         SERVER_TERMINATED,
+        INFRA_CONTINUED,
     }
 )
 
@@ -1467,6 +1473,9 @@ class ActivitySubprocess(WatchedSubprocess):
     _should_retry: bool = attrs.field(default=False, init=False)
     """Whether the task should retry or not as decided by the API server."""
 
+    _worker_sigterm_received: bool = attrs.field(default=False, init=False)
+    _worker_sigterm_handled: bool = attrs.field(default=False, init=False)
+
     # After the failure of a heartbeat, we'll increment this counter. If it reaches `MAX_FAILED_HEARTBEATS`, we
     # will kill theprocess. This is to handle temporary network issues etc. ensuring that the process
     # does not hang around forever.
@@ -1708,6 +1717,9 @@ class ActivitySubprocess(WatchedSubprocess):
             # This listens for activity (e.g., subprocess output) on registered file objects
             alive = self._service_subprocess(max_wait_time=max_wait_time) is None
 
+            if alive and self._worker_sigterm_received and not self._worker_sigterm_handled:
+                self._stop_for_worker_sigterm()
+
             if self._exit_code is not None and self._open_sockets:
                 if (
                     self._process_exit_monotonic
@@ -1804,8 +1816,71 @@ class ActivitySubprocess(WatchedSubprocess):
             )
             self.kill(signal.SIGTERM, force=True)
 
+    def route_worker_sigterm(self) -> Callable[[], None]:
+        """Let the API server decide how a SIGTERM aimed at this worker ends the task; returns the undo."""
+        if threading.current_thread() is not threading.main_thread():
+            return lambda: None
+        wakeup_reader, wakeup_writer = socketpair()
+        wakeup_writer.setblocking(False)
+        self.selector.register(
+            wakeup_reader,
+            selectors.EVENT_READ,
+            (lambda sock: bool(sock.recv(64)), lambda sock: self.selector.unregister(sock)),
+        )
+
+        def on_sigterm(signum: int, frame: FrameType | None) -> None:
+            self._worker_sigterm_received = True
+            with suppress(OSError):
+                wakeup_writer.send(b"\0")
+
+        previous_handler: Callable[[int, FrameType | None], Any] | int | None = signal.signal(
+            signal.SIGTERM, on_sigterm
+        )
+
+        def restore() -> None:
+            signal.signal(signal.SIGTERM, previous_handler)
+            with suppress(KeyError, ValueError):
+                self.selector.unregister(wakeup_reader)
+            wakeup_writer.close()
+            wakeup_reader.close()
+
+        return restore
+
+    def _stop_for_worker_sigterm(self) -> None:
+        self._worker_sigterm_handled = True
+        if self._terminal_state:
+            return
+        server_state: str | None
+        try:
+            server_state = self.client.task_instances.interrupt(id=self.id, reason=WORKER_SIGTERM_REASON)
+        except Exception as e:
+            log.warning("Could not report the worker SIGTERM", ti_id=self.id, exc_info=e)
+            server_state = None
+        self.process_log.warning(
+            "Worker received SIGTERM from its platform",
+            reason=WORKER_SIGTERM_REASON,
+            server_state=server_state,
+        )
+        if server_state == TaskInstanceState.UP_FOR_RESCHEDULE:
+            self._terminal_state = INFRA_CONTINUED
+            self._stop_for_next_execution()
+        elif server_state not in (None, TaskInstanceState.RUNNING):
+            self._terminal_state = SERVER_TERMINATED
+            self.kill(signal.SIGTERM, force=True)
+        # Otherwise warm shutdown: the task keeps running, as it does without a continuation allowance.
+
+    def _stop_for_next_execution(self) -> None:
+        # SIGUSR1 runs on_platform_stop, which lets a resumable operator keep external work for the next execution.
+        with suppress(psutil.NoSuchProcess):
+            self._process.send_signal(signal.SIGUSR1)
+        deadline: float = time.monotonic() + PLATFORM_STOP_GRACE_SECONDS
+        while (remaining := deadline - time.monotonic()) > 0:
+            if self._service_subprocess(max_wait_time=remaining) is not None:
+                return
+        self.kill(signal.SIGKILL)
+
     @property
-    def final_state(self):
+    def final_state(self) -> str:
         """
         The final state of the TaskInstance.
 
@@ -1817,8 +1892,8 @@ class ActivitySubprocess(WatchedSubprocess):
         """
         if self._exit_code == 0:
             return self._terminal_state or TaskInstanceState.SUCCESS
-        if self._exit_code != 0 and self._terminal_state == SERVER_TERMINATED:
-            return SERVER_TERMINATED
+        if self._exit_code != 0 and self._terminal_state in (SERVER_TERMINATED, INFRA_CONTINUED):
+            return self._terminal_state
 
         # Any non zero exit code indicates a failure
         # If retries are configured, mark as UP_FOR_RETRY
@@ -1837,6 +1912,10 @@ class ActivitySubprocess(WatchedSubprocess):
             log.debug("Received message from task runner", msg=msg)
         resp: BaseModel | None = None
         dump_opts: dict[str, bool] = {}
+        if self._terminal_state == INFRA_CONTINUED and isinstance(msg, (TaskState, SucceedTask, RetryTask)):
+            # The server already continued this try in a new execution, so this one reports no state.
+            self.send_msg(None, request_id=req_id, error=None)
+            return
         if isinstance(msg, TaskState):
             # No direct API call here — the recovery path in
             # `update_task_state_if_needed` will call `finish()` for

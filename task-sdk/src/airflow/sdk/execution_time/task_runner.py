@@ -156,6 +156,8 @@ from airflow.sdk.state import TaskScope
 from airflow.sdk.timezone import coerce_datetime
 
 if TYPE_CHECKING:
+    from types import FrameType
+
     import jinja2
     from pendulum.datetime import DateTime
     from structlog.typing import FilteringBoundLogger as Logger
@@ -1575,6 +1577,19 @@ def _run_task_and_map_outcome(
         ti.task.on_kill()
 
     signal.signal(signal.SIGTERM, _on_term)
+
+    def _on_platform_stop(signum: int, frame: FrameType | None) -> None:
+        if os.getpid() != parent_pid:
+            return
+        # Airflow runs this task again, so a resumable operator may leave its external work running.
+        on_platform_stop: Callable[[], None] = getattr(ti.task, "on_platform_stop", ti.task.on_kill)
+        try:
+            on_platform_stop()
+        finally:
+            # The server has retired this execution, so any further work would report under a stale identity.
+            os._exit(0)
+
+    signal.signal(signal.SIGUSR1, _on_platform_stop)
 
     msg: ToSupervisor | None = None
     state: TaskInstanceState | None = None

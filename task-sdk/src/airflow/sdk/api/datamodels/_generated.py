@@ -306,6 +306,25 @@ class TIHeartbeatInfo(BaseModel):
     pid: Annotated[int, Field(title="Pid")]
 
 
+class TIInterruptPayload(BaseModel):
+    """
+    Schema for reporting that a worker's platform is stopping it.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    reason: Annotated[str, Field(max_length=200, title="Reason")]
+
+
+class TIInterruptResponse(BaseModel):
+    """
+    Task instance state chosen after a worker interruption.
+    """
+
+    state: Annotated[str | None, Field(title="State")]
+
+
 class TIRescheduleStatePayload(BaseModel):
     """
     Schema for updating TaskInstance to a up_for_reschedule state.

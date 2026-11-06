@@ -41,7 +41,7 @@ from sqlalchemy.sql import select
 from structlog.contextvars import bind_contextvars
 
 from airflow._shared.observability.traces import override_ids
-from airflow._shared.state import TaskScope
+from airflow._shared.state import TaskFailureKind, TaskScope
 from airflow._shared.timezones import timezone
 from airflow.api_fastapi.common.dagbag import DagBagDep, get_latest_version_of_dag
 from airflow.api_fastapi.common.db.common import AsyncSessionDep
@@ -60,6 +60,8 @@ from airflow.api_fastapi.execution_api.datamodels.taskinstance import (
     TIDeferredStatePayload,
     TIEnterRunningPayload,
     TIHeartbeatInfo,
+    TIInterruptPayload,
+    TIInterruptResponse,
     TIRescheduleStatePayload,
     TIRetryStatePayload,
     TIRunContext,
@@ -1012,6 +1014,53 @@ async def ti_heartbeat(
         update(TI).where(TI.id == task_instance_id).values(last_heartbeat_at=timezone.utcnow())
     )
     log.debug("Heartbeat updated", state=previous_state)
+
+
+@ti_id_router.post(
+    "/{task_instance_id}/interrupt",
+    status_code=status.HTTP_200_OK,
+    responses={status.HTTP_404_NOT_FOUND: {"description": "Task Instance not found"}},
+)
+def ti_interrupt(
+    task_instance_id: UUID,
+    ti_payload: TIInterruptPayload,
+    session: SessionDep,
+    dag_bag: DagBagDep,
+) -> TIInterruptResponse:
+    """Continue the same try in a new execution when the platform stops a running worker."""
+    bind_contextvars(ti_id=str(task_instance_id))
+    ti: TI | None = session.get(TI, task_instance_id, with_for_update={"of": TI})
+    if ti is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason": "not_found", "message": "Task Instance not found"},
+        )
+    if ti.state != TaskInstanceState.RUNNING:
+        return TIInterruptResponse(state=ti.state)
+    max_infra_retries: int = conf.getint("core", "max_infra_retries", fallback=0)
+    if ti.infra_reschedule_count >= max_infra_retries:
+        # Without an allowance the supervisor falls back to its warm shutdown and the try keeps running.
+        log.info(
+            "No infrastructure continuation left; leaving the task running",
+            reason=ti_payload.reason,
+            infra_reschedule_count=ti.infra_reschedule_count,
+            max_infra_retries=max_infra_retries,
+        )
+        return TIInterruptResponse(state=ti.state)
+    dag = dag_bag.get_dag_for_run(dag_run=ti.dag_run, session=session)
+    if dag is None or not dag.has_task(ti.task_id):
+        log.warning("Task definition unavailable; leaving the interruption to the scheduler")
+        return TIInterruptResponse(state=ti.state)
+    ti.task = dag.get_task(ti.task_id)
+    ti.handle_failure(
+        error=f"Worker stopped by its platform ({ti_payload.reason})",
+        session=session,
+        failure_kind=TaskFailureKind.INFRA,
+        reason=ti_payload.reason,
+        allow_infra_continuation=True,
+    )
+    log.info("Worker interruption recorded", reason=ti_payload.reason, state=ti.state)
+    return TIInterruptResponse(state=ti.state)
 
 
 @ti_id_router.put(

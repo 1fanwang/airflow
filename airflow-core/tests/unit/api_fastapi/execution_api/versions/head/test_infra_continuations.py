@@ -721,3 +721,71 @@ def test_logs_exist_for_submission_retry(
         url=f"/api/v2/dags/{ti.dag_id}/dagRuns/{ti.run_id}/taskInstances/{ti.task_id}/logs/{ti.try_number}"
     )
     assert response.status_code == HTTPStatus.OK, response.text
+
+
+def _interrupt(*, ti: TaskInstance, client: TestClient, session: Session) -> str | None:
+    response = client.post(
+        url=f"/execution/task-instances/{ti.id}/interrupt", json={"reason": "WorkerSIGTERM"}
+    )
+    assert response.status_code == HTTPStatus.OK, response.text
+    ti.refresh_from_db(session=session)
+    return response.json()["state"]
+
+
+@conf_vars({("core", "max_infra_retries"): "1"})
+def test_worker_interrupt_continues_same_try(
+    continuation_ti: TaskInstance, client: TestClient, session: Session
+) -> None:
+    ti = continuation_ti
+    _start_attempt(ti=ti, client=client, session=session)
+    original_id = ti.id
+
+    assert _interrupt(ti=ti, client=client, session=session) == TaskInstanceState.UP_FOR_RESCHEDULE
+    assert ti.id != original_id
+    assert (ti.state, ti.try_number, ti.max_tries, ti.infra_reschedule_count) == (
+        TaskInstanceState.UP_FOR_RESCHEDULE,
+        1,
+        0,
+        1,
+    )
+    histories = session.scalars(select(TaskInstanceHistory)).all()
+    assert [(row.id, row.state, row.try_number) for row in histories] == [
+        (original_id, TaskInstanceState.UP_FOR_RESCHEDULE, 1)
+    ]
+
+
+@pytest.mark.parametrize("budget", [0, 1])
+def test_worker_interrupt_without_allowance_leaves_try_running(
+    continuation_ti: TaskInstance, client: TestClient, session: Session, budget: int
+) -> None:
+    ti = continuation_ti
+    with conf_vars({("core", "max_infra_retries"): str(budget)}):
+        _start_attempt(ti=ti, client=client, session=session)
+        if budget:
+            _executor_failure(ti=ti, session=session)
+            _start_attempt(ti=ti, client=client, session=session)
+        running_id = ti.id
+
+        assert _interrupt(ti=ti, client=client, session=session) == TaskInstanceState.RUNNING
+    assert (ti.id, ti.state, ti.try_number, ti.infra_reschedule_count) == (
+        running_id,
+        TaskInstanceState.RUNNING,
+        1,
+        budget,
+    )
+    assert len(session.scalars(select(TaskInstanceHistory)).all()) == budget
+
+
+@pytest.mark.parametrize("state", [TaskInstanceState.SUCCESS, TaskInstanceState.FAILED])
+@conf_vars({("core", "max_infra_retries"): "1"})
+def test_worker_interrupt_does_not_change_finished_execution(
+    continuation_ti: TaskInstance, client: TestClient, session: Session, state: TaskInstanceState
+) -> None:
+    ti = continuation_ti
+    _start_attempt(ti=ti, client=client, session=session)
+    original_id = ti.id
+    ti.set_state(state=state, session=session)
+    session.commit()
+
+    assert _interrupt(ti=ti, client=client, session=session) == state
+    assert (ti.id, ti.state, ti.try_number, ti.infra_reschedule_count) == (original_id, state, 1, 0)

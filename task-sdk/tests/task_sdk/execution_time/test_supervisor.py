@@ -38,6 +38,7 @@ from time import sleep
 from typing import TYPE_CHECKING, Any
 from unittest import mock
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 import httpx
 import msgspec
@@ -162,6 +163,7 @@ from airflow.sdk.execution_time.comms import (
     _ResponseFrame,
 )
 from airflow.sdk.execution_time.supervisor import (
+    INFRA_CONTINUED,
     SERVER_TERMINATED,
     ActivitySubprocess,
     InProcessSupervisorComms,
@@ -524,6 +526,85 @@ class TestWatchedSubprocess:
         proc.wait()
         captured = capfd.readouterr()
         assert "On kill hook called!" in captured.out
+
+    @pytest.mark.parametrize(
+        ("server_state", "final_state", "hook_output"),
+        [
+            pytest.param("up_for_reschedule", INFRA_CONTINUED, "Platform stop hook called!", id="continued"),
+            pytest.param("running", TaskInstanceState.SUCCESS, None, id="no-allowance"),
+            pytest.param("failed", SERVER_TERMINATED, "On kill hook called!", id="already-finished"),
+        ],
+    )
+    def test_worker_sigterm_reported_to_server(
+        self,
+        mocked_parse,
+        create_runtime_ti,
+        make_ti_context_dict,
+        capfd,
+        server_state: str,
+        final_state: str,
+        hook_output: str | None,
+    ):
+        main_pid = os.getpid()
+        ti_id = UUID("4d828a62-a417-4936-a7a6-2b3fabacecab")
+        interrupts: list[dict[str, Any]] = []
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            if request.url.path == f"/task-instances/{ti_id}/interrupt":
+                interrupts.append(json.loads(request.content))
+                return httpx.Response(200, json={"state": server_state})
+            if request.url.path == f"/task-instances/{ti_id}/run":
+                return httpx.Response(200, json=make_ti_context_dict())
+            return httpx.Response(status_code=204)
+
+        def subprocess_main():
+            CommsDecoder()._get_response()
+
+            class ResumableOperator(BaseOperator):
+                def execute(self, context):
+                    sleep(0.5)
+                    os.kill(main_pid, signal.SIGTERM)
+                    sleep(2)
+                    print("Task finished!")
+
+                def on_kill(self) -> None:
+                    print("On kill hook called!")
+
+                def on_platform_stop(self) -> None:
+                    print("Platform stop hook called!")
+
+            runtime_ti = create_runtime_ti(dag_id="c", task=ResumableOperator(task_id="b"))
+            run(runtime_ti, context=runtime_ti.get_template_context(), log=mock.MagicMock())
+
+        proc = ActivitySubprocess.start(
+            dag_rel_path=os.devnull,
+            bundle_info=FAKE_BUNDLE,
+            what=TaskInstance(
+                id=ti_id,
+                task_id="b",
+                dag_id="c",
+                run_id="d",
+                try_number=1,
+                dag_version_id=uuid7(),
+                queue="default",
+            ),
+            client=make_client(transport=httpx.MockTransport(handle_request)),
+            target=subprocess_main,
+        )
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        restore = proc.route_worker_sigterm()
+        try:
+            proc.wait()
+        finally:
+            restore()
+
+        assert signal.getsignal(signal.SIGTERM) is previous_handler
+        assert interrupts == [{"reason": "WorkerSIGTERM"}]
+        assert proc.final_state == final_state
+        out = capfd.readouterr().out
+        for line in ("Platform stop hook called!", "On kill hook called!"):
+            assert (line in out) is (line == hook_output)
+        assert ("Task finished!" in out) is (final_state != INFRA_CONTINUED)
 
     def test_subprocess_sigkilled(self, client_with_ti_start):
         main_pid = os.getpid()
