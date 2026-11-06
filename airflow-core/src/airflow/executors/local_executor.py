@@ -30,6 +30,7 @@ import ctypes
 import multiprocessing
 import multiprocessing.sharedctypes
 import os
+import signal
 import sys
 from multiprocessing import Queue, SimpleQueue
 from typing import TYPE_CHECKING
@@ -74,10 +75,10 @@ def _run_worker(
     unread_messages: multiprocessing.sharedctypes.Synchronized[int],
     team_conf,
 ):
-    import signal
-
     # Ignore ctrl-c in this process -- we don't want to kill _this_ one. we let tasks run to completion
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # A worker killed while idle can hold the queue's read lock; supervise() handles SIGTERM during a task.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     log = structlog.get_logger(logger_name)
     log.info("Worker starting up pid=%d", os.getpid())
@@ -273,11 +274,15 @@ class LocalExecutor(BaseExecutor):
             self.log.exception("Error reading from result queue")
 
     def end(self) -> None:
-        """End the executor."""
-        self.log.info(
-            "Shutting down LocalExecutor"
-            "; waiting for running tasks to finish.  Signal again if you don't want to wait."
-        )
+        """End the executor, handing running tasks to the API server when continuations are enabled."""
+        hand_off_running_tasks: bool = self.conf.getint("core", "max_infra_retries", fallback=0) > 0
+        if hand_off_running_tasks:
+            self.log.info("Shutting down LocalExecutor; asking the API server to continue running tasks")
+        else:
+            self.log.info(
+                "Shutting down LocalExecutor"
+                "; waiting for running tasks to finish.  Signal again if you don't want to wait."
+            )
 
         # We can't tell which proc will pick which close message up, so we send all the messages, and then
         # wait on all the procs
@@ -286,6 +291,12 @@ class LocalExecutor(BaseExecutor):
             # Send the shutdown message once for each alive worker
             if proc.is_alive():
                 self.activity_queue.put(None)
+
+        if hand_off_running_tasks:
+            # Tasks run inside the scheduler's process tree, so stopping the scheduler is a platform stop for them.
+            for pid, proc in self.workers.items():
+                if proc.is_alive():
+                    os.kill(pid, signal.SIGTERM)
 
         # To prevent deadlock, we should consume results from result_queue while waiting for processes to join.
         # Otherwise, a worker blocked on putting results into a full result_queue pipe will never exit,

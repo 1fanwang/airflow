@@ -20,6 +20,8 @@ from __future__ import annotations
 import gc
 import multiprocessing
 import os
+import signal
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -97,6 +99,23 @@ def _write_large_results_to_queue(result_queue, result_count, payload_size):
     for index in range(result_count):
         key = TaskInstanceKey("test_dag", f"test_task_{index}", "test_run")
         result_queue.put((key, State.SUCCESS, payload))
+
+
+def _ignores_sigterm(pid: int) -> bool:
+    with open(f"/proc/{pid}/status") as status:
+        for line in status:
+            if line.startswith("SigIgn:"):
+                return bool(int(line.split()[1], 16) & (1 << (signal.SIGTERM - 1)))
+    return False
+
+
+def _wait_for(condition, timeout: float = 10) -> bool:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
 
 
 class TestLocalExecutor:
@@ -369,6 +388,80 @@ class TestLocalExecutor:
         executor.end()
 
         assert len(executor.event_buffer) == result_count
+
+    @pytest.mark.skipif(not os.path.exists("/proc/self/status"), reason="reads the signal mask from /proc")
+    @pytest.mark.execution_timeout(30)
+    def test_idle_worker_survives_sigterm(self):
+        executor = LocalExecutor(parallelism=1)
+        executor.start()
+        try:
+            if not executor.workers:
+                executor._spawn_worker()
+            pid, proc = next(iter(executor.workers.items()))
+
+            assert _wait_for(lambda: _ignores_sigterm(pid))
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.2)
+            assert proc.is_alive()
+        finally:
+            executor.end()
+
+    @skip_non_fork_mp_start
+    @pytest.mark.execution_timeout(30)
+    @pytest.mark.parametrize(("max_infra_retries", "hands_off"), [("2", True), ("0", False)])
+    @mock.patch("airflow.executors.base_executor.BaseExecutor.run_workload")
+    def test_end_hands_running_tasks_off_when_continuations_enabled(
+        self, mock_run_workload, max_infra_retries, hands_off, tmp_path
+    ):
+        started = tmp_path / "started"
+        handed_off = tmp_path / "handed_off"
+
+        def fake_run_workload(workload, **kwargs):
+            received: list[int] = []
+            previous = signal.signal(signal.SIGTERM, lambda signum, frame: received.append(signum))
+            try:
+                started.touch()
+                _wait_for(lambda: bool(received), timeout=3)
+            finally:
+                signal.signal(signal.SIGTERM, previous)
+            if received:
+                handed_off.touch()
+            return 0
+
+        mock_run_workload.side_effect = fake_run_workload
+        ti = TaskInstanceDTO(
+            id=uuid7(),
+            dag_version_id=uuid7(),
+            task_id="long_running",
+            dag_id="mydag",
+            run_id="run1",
+            try_number=1,
+            state="queued",
+            pool_slots=1,
+            queue="default",
+            priority_weight=1,
+            map_index=-1,
+            start_date=timezone.utcnow(),
+        )
+        executor = LocalExecutor(parallelism=2)
+        executor.start()
+        executor.queue_workload(
+            workloads.ExecuteTask(
+                token="",
+                ti=ti,
+                dag_rel_path="some/path",
+                log_path=None,
+                bundle_info=dict(name="hi", version="hi"),
+            ),
+            session=mock.MagicMock(spec=Session),
+        )
+        executor._process_workloads(list(executor.executor_queues[WorkloadType.EXECUTE_TASK].values()))
+        assert _wait_for(started.exists)
+
+        with conf_vars({("core", "max_infra_retries"): max_infra_retries}):
+            executor.end()
+
+        assert handed_off.exists() is hands_off
 
     @pytest.mark.parametrize(
         ("conf_values", "expected_server"),
