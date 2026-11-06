@@ -67,11 +67,13 @@ Why ``ExecutionAPIRoute`` is needed:
 # Disable future annotations in this file to work around https://github.com/fastapi/fastapi/issues/13056
 # ruff: noqa: I002
 
+import inspect
 from typing import Any, get_args
 
 import structlog
 import svcs
 from fastapi import Depends, HTTPException, Request, Response, status
+from fastapi.dependencies.models import Dependant
 from fastapi.params import Security as SecurityParam
 from fastapi.routing import APIRoute
 from fastapi.security import HTTPBearer, SecurityScopes
@@ -79,6 +81,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from airflow.api_fastapi.auth.tokens import JWTGenerator, JWTValidator
+from airflow.api_fastapi.common.db.common import _get_async_session
 from airflow.api_fastapi.execution_api.datamodels.token import TIClaims, TIToken, TokenScope
 from airflow.api_fastapi.execution_api.deps import DepContainer, SessionDep
 from airflow.models.taskinstance import TaskInstance
@@ -147,6 +150,17 @@ class JWTBearer(HTTPBearer):
 _jwt_bearer = JWTBearer()
 
 
+def _writes_through_async_session(route: APIRoute) -> bool:
+    pending: list[Dependant] = [route.dependant]
+    while pending:
+        dependant = pending.pop()
+        # Cadwyn wraps dependency callables when it builds the versioned routes.
+        if dependant.call is not None and inspect.unwrap(dependant.call) is _get_async_session:
+            return True
+        pending.extend(dependant.dependencies)
+    return False
+
+
 def fence_task_execution(
     request: Request,
     session: SessionDep,
@@ -156,6 +170,9 @@ def fence_task_execution(
     if request.method in {"GET", "HEAD", "OPTIONS"} or request.scope.get("execution_api_fenced"):
         return
     route = request.scope.get("route")
+    # Must skip: this request's row lock would deadlock a write on the route's own async connection.
+    if isinstance(route, APIRoute) and _writes_through_async_session(route):
+        return
     if token.claims.scope not in getattr(route, "allowed_token_types", frozenset({"execution"})):
         return
     # Callback and connection-test tokens identify other workloads, not a task execution.
