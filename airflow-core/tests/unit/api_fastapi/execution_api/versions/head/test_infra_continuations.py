@@ -497,6 +497,23 @@ def test_retired_execution_remains_fenced_after_history_cleanup(
     }, response.text
 
 
+@conf_vars({("core", "max_infra_retries"): "1"})
+def test_heartbeat_is_not_blocked_by_the_execution_fence(
+    continuation_ti: TaskInstance, client: TestClient, session: Session
+) -> None:
+    ti = continuation_ti
+    _start_attempt(ti=ti, client=client, session=session)
+    old_id: UUID = ti.id
+    heartbeat: dict[str, Any] = {"hostname": "continuation-local", "pid": 100}
+
+    live_response = client.put(url=f"/execution/task-instances/{old_id}/heartbeat", json=heartbeat)
+    _executor_failure(ti=ti, session=session)
+    replaced_response = client.put(url=f"/execution/task-instances/{old_id}/heartbeat", json=heartbeat)
+
+    assert live_response.status_code == HTTPStatus.NO_CONTENT, live_response.text
+    assert replaced_response.status_code == HTTPStatus.GONE, replaced_response.text
+
+
 @conf_vars({("core", "max_infra_retries"): "2"})
 def test_generic_reschedule_keeps_identity_and_allowance(
     continuation_ti: TaskInstance, client: TestClient, session: Session
