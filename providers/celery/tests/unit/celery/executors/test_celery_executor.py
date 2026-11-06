@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import signal
@@ -31,6 +32,7 @@ import pytest
 import time_machine
 from celery import Celery
 from celery.result import AsyncResult
+from celery.worker.request import Request
 from kombu.asynchronous import set_event_loop
 
 from airflow.exceptions import AirflowProviderDeprecationWarning
@@ -1669,3 +1671,40 @@ class TestCreateCeleryAppTeamIsolation:
         team_conf = ExecutorConf(team_name="team_beta")
         celery_app = celery_executor_utils.create_celery_app(team_conf)
         assert "team_beta" in celery_app.main
+
+
+def _active_request(name: str, worker_pid: int | None, workload_type: str) -> mock.MagicMock:
+    request = mock.MagicMock(spec=Request)
+    request.name = name
+    request.worker_pid = worker_pid
+    request.args = [json.dumps({"type": workload_type})]
+    return request
+
+
+@pytest.mark.parametrize(
+    ("sig", "how", "max_infra_retries", "forwarded_pids"),
+    [
+        pytest.param("SIGTERM", "Warm", "2", [101], id="platform-stop"),
+        pytest.param("SIGINT", "Warm", "2", [], id="interactive-stop-waits"),
+        pytest.param("SIGQUIT", "Cold", "2", [], id="cold-shutdown"),
+        pytest.param("SIGTERM", "Warm", "0", [], id="continuations-disabled"),
+    ],
+)
+def test_warm_shutdown_forwards_sigterm_to_running_tasks(
+    sig: str, how: str, max_infra_retries: str, forwarded_pids: list[int]
+) -> None:
+    requests = [
+        _active_request(name="execute_workload", worker_pid=101, workload_type="ExecuteTask"),
+        _active_request(name="execute_workload", worker_pid=102, workload_type="ExecuteCallback"),
+        _active_request(name="execute_workload", worker_pid=None, workload_type="ExecuteTask"),
+        _active_request(name="execute_workload", worker_pid=os.getpid(), workload_type="ExecuteTask"),
+        _active_request(name="other_task", worker_pid=103, workload_type="ExecuteTask"),
+    ]
+    with (
+        conf_vars({("core", "max_infra_retries"): max_infra_retries}),
+        mock.patch.object(celery_executor_utils.celery_worker_state, "active_requests", set(requests)),
+        mock.patch.object(celery_executor_utils.os, "kill", autospec=True) as kill,
+    ):
+        celery_executor_utils.on_celery_worker_shutting_down(sig=sig, how=how, exitcode=0)
+
+    assert kill.call_args_list == [mock.call(pid, signal.SIGTERM) for pid in forwarded_pids]

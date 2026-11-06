@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import json
 import logging
 import math
 import os
+import signal
 import subprocess
 import sys
 import traceback
@@ -39,7 +41,8 @@ from typing import TYPE_CHECKING, Any
 from celery import Celery, states as celery_states
 from celery.backends.base import BaseKeyValueStoreBackend
 from celery.backends.database import DatabaseBackend, Task as TaskDb, retry, session_cleanup
-from celery.signals import import_modules as celery_import_modules, worker_ready
+from celery.signals import import_modules as celery_import_modules, worker_ready, worker_shutting_down
+from celery.worker import state as celery_worker_state
 from sqlalchemy import select
 
 from airflow.executors.base_executor import BaseExecutor
@@ -218,6 +221,19 @@ def on_celery_import_modules(*args, **kwargs):
 def on_celery_worker_ready(*args, **kwargs):
     # Unfreeze the objects from gc freeze when the ForkPoolWorker is all loaded.
     gc.unfreeze()
+
+
+@worker_shutting_down.connect
+def on_celery_worker_shutting_down(sig: str, how: str, exitcode: int, **kwargs: Any) -> None:
+    """Forward a warm-shutdown SIGTERM to running tasks so each supervisor can report the platform stop."""
+    if sig != "SIGTERM" or how != "Warm" or conf.getint("core", "max_infra_retries", fallback=0) <= 0:
+        return
+    for request in list(celery_worker_state.active_requests):
+        # Solo and thread pools run tasks in this process, which must not signal itself.
+        if request.name != "execute_workload" or request.worker_pid in (None, os.getpid()):
+            continue
+        if json.loads(request.args[0]).get("type") == "ExecuteTask":
+            os.kill(request.worker_pid, signal.SIGTERM)
 
 
 # Once Celery 5.5 is out of beta, we can pass `pydantic=True` to the decorator and it will handle the validation
