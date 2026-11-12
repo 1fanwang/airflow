@@ -98,6 +98,7 @@ from airflow.models.log import Log, resolve_team_name
 from airflow.models.pool import Pool
 from airflow.models.serialized_dag import SerializedDagModel
 from airflow.models.taskinstance import TaskInstance
+from airflow.models.taskinstancehistory import TaskInstanceHistory
 from airflow.models.taskinstancekey import TaskInstanceKey
 from airflow.models.team import Team
 from airflow.models.trigger import Trigger
@@ -5511,6 +5512,80 @@ class TestSchedulerJob:
         assert tih.hostname == hostname
         assert tih.start_date == DEFAULT_DATE
 
+    @pytest.mark.parametrize(
+        ("initial_state", "retries", "expected_state", "rotates_id"),
+        [
+            (TaskInstanceState.RUNNING, 1, TaskInstanceState.UP_FOR_RETRY, True),
+            (TaskInstanceState.QUEUED, 1, TaskInstanceState.UP_FOR_RETRY, True),
+            (TaskInstanceState.SCHEDULED, 1, TaskInstanceState.UP_FOR_RETRY, True),
+            (TaskInstanceState.RUNNING, 0, TaskInstanceState.FAILED, False),
+            (TaskInstanceState.RESTARTING, 0, TaskInstanceState.UP_FOR_RETRY, False),
+        ],
+    )
+    @pytest.mark.parametrize(("with_callback", "with_email"), [(True, True), (True, False), (False, True)])
+    @conf_vars({("core", "max_infra_retries"): "0"})
+    def test_executor_failure_notifications_keep_attempt_identity(
+        self: TestSchedulerJob,
+        initial_state: TaskInstanceState,
+        retries: int,
+        expected_state: TaskInstanceState,
+        rotates_id: bool,
+        with_callback: bool,
+        with_email: bool,
+        dag_maker: DagMaker,
+        session: Session,
+    ) -> None:
+        with dag_maker(dag_id="executor_notification_identity", fileloc="/test_path/"):
+            task = EmptyOperator(
+                task_id="task",
+                retries=retries,
+                on_retry_callback=(lambda context: None) if with_callback else None,
+                on_failure_callback=(lambda context: None) if with_callback else None,
+                email="notification@example.invalid" if with_email else None,
+                email_on_retry=True,
+                email_on_failure=True,
+            )
+        ti: TaskInstance | None = dag_maker.create_dagrun(state=DagRunState.RUNNING).get_task_instance(
+            task_id=task.task_id, session=session
+        )
+        assert ti is not None
+        ti.state = initial_state
+        ti.try_number = 1
+        ti.queued_by_job_id = 1
+        session.flush()
+        failed_id: UUID = ti.id
+        executor = MockExecutor(do_update=False)
+        runner = SchedulerJobRunner(job=Job(), executors=[executor])
+        executor.fail(key=ti.key)
+
+        SchedulerJobRunner.process_executor_events(
+            executor=executor, job_id=1, scheduler_dag_bag=runner.scheduler_dag_bag, session=session
+        )
+        ti.refresh_from_db(session=session)
+
+        assert (ti.state, ti.try_number, ti.max_tries) == (expected_state, 1, retries)
+        assert (ti.id != failed_id) is rotates_id
+        if rotates_id:
+            history: TaskInstanceHistory | None = session.get(entity=TaskInstanceHistory, ident=failed_id)
+            assert history is not None
+            assert history.try_number == 1
+        assert isinstance(executor.callback_sink, mock.MagicMock)
+        requests: list[TaskCallbackRequest | EmailRequest] = [
+            call.args[0] for call in executor.callback_sink.send.call_args_list
+        ]
+        assert len(requests) == int(with_callback) + int(with_email)
+        for request in requests:
+            assert request.ti.id == failed_id
+            assert request.ti.try_number == 1
+            assert request.context_from_server is not None
+            assert request.context_from_server.max_tries == retries
+            if isinstance(request, TaskCallbackRequest):
+                assert request.task_callback_type == expected_state
+            else:
+                assert request.email_type == (
+                    "retry" if expected_state == TaskInstanceState.UP_FOR_RETRY else "failure"
+                )
+
     def test_adopt_or_reset_orphaned_tasks_external_triggered_dag(self, dag_maker, session):
         dag_id = "test_reset_orphaned_tasks_external_triggered_dag"
         with dag_maker(dag_id=dag_id, schedule="@daily"):
@@ -6161,7 +6236,6 @@ class TestSchedulerJob:
     @pytest.mark.need_serialized_dag
     @pytest.mark.backend("postgres", "mysql")
     def test_create_dag_runs_when_concurrent_asset_events_created(self, session: Session, dag_maker, caplog):
-
         ASSET_EVENT_COUNT = 30
         asset = Asset(name="test_asset")
         with dag_maker(dag_id="consumer", schedule=asset, session=session):
@@ -6181,7 +6255,6 @@ class TestSchedulerJob:
         asset_event_metadata: list[tuple[int, datetime.datetime]] = []
 
         def create_asset_events(sleep):
-
             with create_session() as session:
                 # Re-fetch the DagModel in this thread's own session so all ORM access stays
                 # thread-local.
