@@ -37,6 +37,7 @@ from tests_common.test_utils.mock_executor import MockExecutor
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from uuid import UUID
 
     from sqlalchemy.orm import Session
 
@@ -103,6 +104,7 @@ def test_infrastructure_retry_precedes_all_failure_consumers(
     ti.max_tries = max_tries
     ti.queued_by_job_id = 1
     session.flush()
+    failed_id: UUID = ti.id
     executor = MockExecutor(do_update=False)
     runner = SchedulerJobRunner(job=Job(), executors=[executor])
     executor.fail(key=ti.key, failure_kind=TaskFailureKind.INFRA, reason="PreemptionByScheduler")
@@ -123,10 +125,12 @@ def test_infrastructure_retry_precedes_all_failure_consumers(
     email: EmailRequest = executor.callback_sink.send.call_args_list[1].args[0]
     assert executor.callback_sink.send.call_count == 2
     assert isinstance(callback, TaskCallbackRequest)
+    assert callback.ti.id == failed_id
     assert callback.task_callback_type == expected_state
     assert callback.context_from_server is not None
     assert callback.context_from_server.max_tries == expected_max_tries
     assert isinstance(email, EmailRequest)
+    assert email.ti.id == failed_id
     assert email.email_type == ("retry" if expected_state == TaskInstanceState.UP_FOR_RETRY else "failure")
     assert email.context_from_server.max_tries == expected_max_tries
 

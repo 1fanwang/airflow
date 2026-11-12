@@ -57,7 +57,11 @@ from sqlalchemy.sql import expression
 from airflow import settings
 from airflow._shared.observability.metrics import stats
 from airflow._shared.timezones import timezone
-from airflow.api_fastapi.execution_api.datamodels.taskinstance import DagRun as DRDataModel, TIRunContext
+from airflow.api_fastapi.execution_api.datamodels.taskinstance import (
+    DagRun as DRDataModel,
+    TaskInstance as TIDataModel,
+    TIRunContext,
+)
 from airflow.assets.evaluation import AssetEvaluator
 from airflow.callbacks.callback_requests import (
     DagCallbackRequest,
@@ -1641,6 +1645,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     ti.set_state(None)
                     continue
 
+                failed_ti_id: UUID = ti.id
                 ti.handle_failure(
                     error=msg,
                     session=session,
@@ -1648,6 +1653,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     reason=reason,
                 )
                 final_state: TaskInstanceState = cast("TaskInstanceState", ti.state)
+                notification_ti: TIDataModel | None = None
 
                 if task.has_on_retry_callback or task.has_on_failure_callback:
                     # Only log the error/extra info here, since the `ti.handle_failure()` path will log it
@@ -1668,12 +1674,14 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     # Backfill dag_version_id for legacy tasks (Pydantic requires uuid.UUID).
                     if not _ensure_ti_has_dag_version_id(ti, session, cls.logger()):
                         continue
+                    notification_ti = TIDataModel.model_validate(obj=ti, from_attributes=True)
+                    notification_ti.id = failed_ti_id
                     request = TaskCallbackRequest(
                         filepath=ti.dag_model.relative_fileloc or "",
                         bundle_name=_bundle_name,
                         bundle_version=_bundle_version,
                         version_data=_version_data,
-                        ti=ti,
+                        ti=notification_ti,
                         msg=msg,
                         task_callback_type=final_state,
                         context_from_server=TIRunContext(
@@ -1704,12 +1712,15 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     # Backfill dag_version_id for legacy tasks (Pydantic requires uuid.UUID).
                     if not _ensure_ti_has_dag_version_id(ti, session, cls.logger()):
                         continue
+                    if notification_ti is None:
+                        notification_ti = TIDataModel.model_validate(obj=ti, from_attributes=True)
+                        notification_ti.id = failed_ti_id
                     email_request = EmailRequest(
                         filepath=ti.dag_model.relative_fileloc or "",
                         bundle_name=_email_bundle_name,
                         bundle_version=_email_bundle_version,
                         version_data=_email_version_data,
-                        ti=ti,
+                        ti=notification_ti,
                         msg=msg,
                         email_type="retry" if final_state == TaskInstanceState.UP_FOR_RETRY else "failure",
                         context_from_server=TIRunContext(
