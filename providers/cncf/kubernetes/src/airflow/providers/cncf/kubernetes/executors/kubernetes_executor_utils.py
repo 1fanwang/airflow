@@ -497,6 +497,11 @@ def classify_pod_failure(
         return None
     disruption_reason = failure_details.get("disruption_reason")
     pod_reason = failure_details.get("pod_reason")
+    # Node-pressure evictions also use TerminationByKubelet but often remove the pod causing the pressure:
+    # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/eviction/eviction_manager.go#L439-L447
+    # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/eviction/helpers.go#L43-L44
+    if disruption_reason == "TerminationByKubelet" and pod_reason == "Evicted":
+        return None, pod_reason
     if disruption_reason in _DISRUPTION_TARGET_REASONS:
         return TaskFailureKind.INFRA, disruption_reason
     if pod_reason in _INFRA_POD_REASONS:

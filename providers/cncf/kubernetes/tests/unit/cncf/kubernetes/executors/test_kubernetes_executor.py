@@ -5245,8 +5245,26 @@ class TestKubernetesExecutorFailureCause:
                     "pod_reason": "Evicted",
                     "disruption_reason": "TerminationByKubelet",
                 },
+                (None, "Evicted"),
+                id="kubelet-node-pressure-eviction",
+            ),
+            pytest.param(
+                {
+                    "pod_status": "Failed",
+                    "pod_reason": "Terminated",
+                    "disruption_reason": "TerminationByKubelet",
+                },
                 ("infra", "TerminationByKubelet"),
-                id="kubelet-termination",
+                id="kubelet-node-shutdown",
+            ),
+            pytest.param(
+                {
+                    "pod_status": "Failed",
+                    "pod_reason": "Preempting",
+                    "disruption_reason": "TerminationByKubelet",
+                },
+                ("infra", "TerminationByKubelet"),
+                id="kubelet-preemption",
             ),
             pytest.param(
                 {"pod_status": "Failed", "pod_reason": "Terminated"},
