@@ -1699,6 +1699,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         # multi-schedulers
         locked_query = with_row_locks(query, of=TI, session=session, skip_locked=True)
         tis: Iterator[TI] = session.scalars(locked_query.execution_options(populate_existing=True))
+        infra_retries_enabled: bool = conf.getint("core", "max_infra_retries") > 0
         for ti in tis:
             buffer_key = TaskInstanceUuid(ti.id)
             try_number = ti.try_number
@@ -1712,6 +1713,15 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 ti.external_executor_id = info
                 cls.logger().info("Setting external_executor_id for %s to %s", ti, info)
                 continue
+
+            if infra_retries_enabled and ti.state in (
+                TaskInstanceState.SCHEDULED,
+                TaskInstanceState.QUEUED,
+                TaskInstanceState.RUNNING,
+            ):
+                # The infrastructure retry decision needs the current row, but handling an earlier
+                # failure in this batch commits and releases the row locks taken above.
+                ti.refresh_from_db(session=session, lock_for_update=True)
 
             msg = (
                 "TaskInstance Finished: dag_id=%s, task_id=%s, run_id=%s, %s, ti_id=%s, "
@@ -1834,6 +1844,15 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     ti.set_state(state, session=session)
                     continue
                 ti.task = task
+                # Requests sent after handle_failure() would miss its commit, so take its decision
+                # from the same locked row here.
+                infra_retry: bool = bool(ti.get_infra_retry_decision(failure_kind=failure_kind))
+                next_state: TaskInstanceState = (
+                    TaskInstanceState.UP_FOR_RETRY
+                    if infra_retry or ti.is_eligible_to_retry()
+                    else TaskInstanceState.FAILED
+                )
+                next_max_tries: int = ti.max_tries + int(infra_retry)
                 if task.has_on_retry_callback or task.has_on_failure_callback:
                     # Only log the error/extra info here, since the `ti.handle_failure()` path will log it
                     # too, which would lead to double logging
@@ -1851,14 +1870,10 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                             ti, model=TIDataModel, map_index=coordinates.public_map_index(ti)
                         ),
                         msg=msg,
-                        task_callback_type=(
-                            TaskInstanceState.UP_FOR_RETRY
-                            if ti.is_eligible_to_retry()
-                            else TaskInstanceState.FAILED
-                        ),
+                        task_callback_type=next_state,
                         context_from_server=TIRunContext(
                             dag_run=DRDataModel.model_validate(ti.dag_run, from_attributes=True),
-                            max_tries=ti.max_tries,
+                            max_tries=next_max_tries,
                             variables=[],
                             connections=[],
                             xcom_keys_to_clear=[],
@@ -1887,10 +1902,10 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                             ti, model=TIDataModel, map_index=coordinates.public_map_index(ti)
                         ),
                         msg=msg,
-                        email_type="retry" if ti.is_eligible_to_retry() else "failure",
+                        email_type="retry" if next_state == TaskInstanceState.UP_FOR_RETRY else "failure",
                         context_from_server=TIRunContext(
                             dag_run=DRDataModel.model_validate(ti.dag_run, from_attributes=True),
-                            max_tries=ti.max_tries,
+                            max_tries=next_max_tries,
                             variables=[],
                             connections=[],
                             xcom_keys_to_clear=[],
