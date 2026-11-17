@@ -455,27 +455,25 @@ def collect_pod_failure_details(pod: k8s.V1Pod, logger) -> FailureDetails | None
 
 
 # Copied because the Kubernetes Python client does not export DisruptionTarget values:
+# https://kubernetes.io/docs/concepts/workloads/pods/disruptions/#pod-disruption-conditions
 # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/staging/src/k8s.io/api/core/v1/types.go#L3751-L3753
 # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/staging/src/k8s.io/api/core/v1/types.go#L3786-L3792
 # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/controller/tainteviction/taint_eviction.go#L135-L141
 # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/controller/podgc/gc_controller.go#L253-L259
-# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/controller/devicetainteviction/device_taint_eviction.go#L481-L486
 _DISRUPTION_TARGET_REASONS: frozenset[str] = frozenset(
     {
         "PreemptionByScheduler",
         "TerminationByKubelet",
         "DeletionByTaintManager",
         "DeletionByPodGC",
-        "DeletionByDeviceTaintManager",
     }
 )
 
-# Needed because kubelets without pod disruption conditions set only these Failed pod reasons:
-# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/preemption/preemption.go#L115-L117
-# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/events/event.go#L26
+# Needed because kubelets without pod disruption conditions mark node shutdown only with this pod reason:
+# https://kubernetes.io/docs/concepts/cluster-administration/node-shutdown/
 # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/nodeshutdown/nodeshutdown_manager.go#L159-L165
 # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/nodeshutdown/nodeshutdown_manager.go#L88
-_INFRA_POD_REASONS: frozenset[str] = frozenset({"Preempting", "Terminated"})
+_INFRA_POD_REASONS: frozenset[str] = frozenset({"Terminated"})
 
 
 def _get_disruption_target_reason(pod_status: k8s.V1PodStatus) -> str | None:

@@ -338,11 +338,13 @@ Failure causes
 On Airflow versions whose executors can report failure causes, a failed worker pod is reported as
 ``failure_kind=infra`` only when Kubernetes documents the disruption: a ``DisruptionTarget`` condition
 with status ``True`` and reason ``PreemptionByScheduler``, ``TerminationByKubelet``,
-``DeletionByTaintManager``, ``DeletionByPodGC`` or ``DeletionByDeviceTaintManager``, or the pod reason
-``Preempting`` or ``Terminated`` from a kubelet that does not set that condition. Node-pressure evictions
+``DeletionByTaintManager`` or ``DeletionByPodGC``, or the pod reason ``Terminated`` from a kubelet that
+does not set that condition. Node-pressure evictions
 keep the pod reason ``Evicted`` without a failure kind: the kubelet also marks them
 ``TerminationByKubelet``, but it evicts pods that use more than they request first, so the evicted
-pod is often the cause of the pressure. Other failures, such as
+pod is often the cause of the pressure. Kubernetes does not document the ``DisruptionTarget`` reason
+``DeletionByDeviceTaintManager`` or the pod reason ``Preempting``, so on their own they are reported as
+the reason without a failure kind. Other failures, such as
 ``OOMKilled``, a bare ``Evicted`` or a pod deletion without that condition, leave the failure kind unset
 and report the Kubernetes reason only. Failure listeners receive both values, as described in
 :doc:`apache-airflow:administration-and-deployment/listeners`.

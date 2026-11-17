@@ -5273,7 +5273,7 @@ class TestKubernetesExecutorFailureCause:
             ),
             pytest.param(
                 {"pod_status": "Failed", "pod_reason": "Preempting"},
-                ("infra", "Preempting"),
+                (None, "Preempting"),
                 id="kubelet-preemption-without-condition",
             ),
             pytest.param(
@@ -5296,8 +5296,17 @@ class TestKubernetesExecutorFailureCause:
                 id="unlisted-disruption-reason",
             ),
             pytest.param(
-                {"pod_status": "Failed", "container_reason": "Preempting"},
-                (None, "Preempting"),
+                {
+                    "pod_status": "Failed",
+                    "container_reason": "Error",
+                    "disruption_reason": "DeletionByDeviceTaintManager",
+                },
+                (None, "DeletionByDeviceTaintManager"),
+                id="device-taint-manager-deletion",
+            ),
+            pytest.param(
+                {"pod_status": "Failed", "container_reason": "Terminated"},
+                (None, "Terminated"),
                 id="container-reason-is-not-a-pod-reason",
             ),
             pytest.param({"pod_status": "Failed"}, None, id="no-reason"),
