@@ -365,16 +365,17 @@ core:
       default: "0"
     max_infra_retries:
       description: |
-        The maximum number of additional retries granted when an executor reports a confirmed infrastructure
-        failure of a running task. Zero disables replacement attempts. Usage is conservatively inferred
-        as ``max(max_tries - retries, try_number - 1, 0)`` for each failure. Ordinary attempts and clears
-        can consume the allowance. An early refusal can change after edits to ``retries``; once
-        ``try_number - 1`` reaches the cap, those edits and clears cannot restore eligibility under
-        the same cap. This deployment setting also applies to tasks with ``retries=0``.
-      version_added: 3.4.0
+        The maximum number of extra attempts a task instance can receive when its executor reports a
+        confirmed infrastructure failure of a running attempt, such as a Kubernetes preemption. These
+        attempts do not use up the task's ``retries``, and tasks with ``retries=0`` also receive them.
+        ``0`` disables infrastructure retries. Failure causes are not stored, so the allowance already
+        used is inferred as ``max(max_tries - retries, try_number - 1, 0)``: ordinary attempts and clears
+        count against it.
+      version_added: 3.5.0
       type: integer
       example: ~
       default: "0"
+      see_also: ":ref:`concepts:infrastructure-retries`"
     default_task_retry_delay:
       description: |
         The number of seconds each task is going to wait by default between retries. Can be overridden at
