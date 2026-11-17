@@ -331,3 +331,15 @@ annotation. Watcher events, adoption and revocation use the submitted attempt's 
 Pre-upgrade task pods can be adopted when their original serialized workload contains
 that UUID. Pods without a recoverable attempt identity are not adopted by a UUID-capable
 executor. Older supported Airflow versions retain coordinate keys and their existing adoption behavior.
+
+Failure causes
+--------------
+
+On Airflow versions whose executors can report failure causes, a failed worker pod is reported as
+``failure_kind=infra`` only when Kubernetes documents the disruption: a ``DisruptionTarget`` condition
+with status ``True`` and reason ``PreemptionByScheduler``, ``TerminationByKubelet``,
+``DeletionByTaintManager``, ``DeletionByPodGC`` or ``DeletionByDeviceTaintManager``, or the pod reason
+``Preempting`` or ``Terminated`` from a kubelet that does not set that condition. Other failures, such as
+``OOMKilled``, a bare ``Evicted`` or a pod deletion without that condition, leave the failure kind unset
+and report the Kubernetes reason only. Failure listeners receive both values, as described in
+:doc:`apache-airflow:administration-and-deployment/listeners`.

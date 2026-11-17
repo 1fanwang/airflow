@@ -16,6 +16,7 @@
 # under the License.
 from __future__ import annotations
 
+import logging
 import random
 import re
 import string
@@ -57,6 +58,7 @@ from airflow.providers.cncf.kubernetes.executors.kubernetes_executor_utils impor
     AirflowKubernetesScheduler,
     KubernetesJobWatcher,
     ResourceVersion,
+    collect_pod_failure_details,
     get_base_pod_from_template,
 )
 from airflow.providers.cncf.kubernetes.kubernetes_helper_functions import (
@@ -2646,6 +2648,30 @@ class TestKubernetesExecutor:
         finally:
             executor.end()
 
+    @mock.patch(
+        "airflow.providers.cncf.kubernetes.executors.kubernetes_executor_utils._SUPPORTS_FAILURE_CAUSE", False
+    )
+    def test_change_state_failed_without_failure_cause_contract_calls_plain_fail(self, mocker):
+        executor = self.kubernetes_executor
+        executor.kube_scheduler = mocker.create_autospec(AirflowKubernetesScheduler, instance=True)
+        fail = mocker.spy(executor, "fail")
+        key = TaskInstanceKey(dag_id="dag_id", task_id="task_id", run_id="run_id", try_number=1)
+        executor.running = {key}
+        results = KubernetesResults(
+            key=key,
+            state=State.FAILED,
+            pod_name="pod_name",
+            namespace="default",
+            resource_version="resource_version",
+            failure_details={"pod_status": "Failed", "disruption_reason": "DeletionByTaintManager"},
+        )
+
+        executor._change_state(results, session=mocker.create_autospec(Session, instance=True))
+
+        fail.assert_called_once_with(key=key, info="Pod failed because of None")
+        assert executor.event_buffer == {key: (State.FAILED, "Pod failed because of None")}
+        assert executor.running == set()
+
     @pytest.mark.parametrize(
         ("team_name", "timer_tags"),
         [
@@ -3796,6 +3822,31 @@ class TestKubernetesJobWatcher:
         self._run()
         self.assert_watcher_queue_called_once_with_state(State.FAILED)
 
+    def test_process_status_running_deleted_reports_disruption_target(self):
+        self.pod.status.phase = "Running"
+        self.pod.status.conditions = [
+            k8s.V1PodCondition(type="DisruptionTarget", status="True", reason="DeletionByTaintManager")
+        ]
+        self.pod.metadata.deletion_timestamp = timezone.utcnow()
+        self.events.append({"type": "DELETED", "object": self.pod})
+
+        self._run()
+        self.watcher.watcher_queue.put.assert_called_once_with(
+            KubernetesWatch(
+                pod_name=self.pod.metadata.name,
+                namespace=self.watcher.namespace,
+                state=State.FAILED,
+                annotations=self.core_annotations,
+                resource_version=self.pod.metadata.resource_version,
+                failure_details={
+                    "pod_status": "Running",
+                    "pod_reason": None,
+                    "pod_message": None,
+                    "disruption_reason": "DeletionByTaintManager",
+                },
+            )
+        )
+
     def test_process_status_running(self):
         self.pod.status.phase = "Running"
         self.events.append({"type": "MODIFIED", "object": self.pod})
@@ -3884,6 +3935,86 @@ class TestKubernetesJobWatcher:
             executor = KubernetesExecutor()
 
         assert executor.kube_config.worker_pod_pending_fatal_container_state_reasons == expected_result
+
+
+class TestCollectPodFailureDetails:
+    @pytest.mark.parametrize(
+        ("condition", "expected"),
+        [
+            pytest.param(
+                k8s.V1PodCondition(type="DisruptionTarget", status="True", reason="PreemptionByScheduler"),
+                "PreemptionByScheduler",
+                id="true-disruption-target",
+            ),
+            pytest.param(
+                k8s.V1PodCondition(type="DisruptionTarget", status="False", reason="PreemptionByScheduler"),
+                None,
+                id="cleared-disruption-target",
+            ),
+            pytest.param(
+                k8s.V1PodCondition(type="Ready", status="True", reason="PreemptionByScheduler"),
+                None,
+                id="other-condition-type",
+            ),
+        ],
+    )
+    def test_failed_pod_keeps_container_details_with_disruption_reason(self, condition, expected):
+        pod = k8s.V1Pod(
+            metadata=k8s.V1ObjectMeta(name="pod"),
+            status=k8s.V1PodStatus(
+                phase="Failed",
+                conditions=[condition],
+                container_statuses=[
+                    k8s.V1ContainerStatus(
+                        name="base",
+                        image="airflow",
+                        image_id="",
+                        ready=False,
+                        restart_count=0,
+                        state=k8s.V1ContainerState(
+                            terminated=k8s.V1ContainerStateTerminated(reason="Error", exit_code=137)
+                        ),
+                    )
+                ],
+            ),
+        )
+
+        details = collect_pod_failure_details(pod=pod, logger=logging.getLogger(__name__))
+
+        assert details is not None
+        assert details["disruption_reason"] == expected
+        assert (details["container_reason"], details["exit_code"]) == ("Error", 137)
+
+    @pytest.mark.parametrize(
+        ("status", "expected"),
+        [
+            pytest.param(
+                "True",
+                {
+                    "pod_status": "Running",
+                    "pod_reason": None,
+                    "pod_message": None,
+                    "disruption_reason": "DeletionByTaintManager",
+                },
+                id="true-disruption-target",
+            ),
+            pytest.param("False", None, id="cleared-disruption-target"),
+        ],
+    )
+    def test_running_pod_reports_only_a_true_disruption_target(self, status, expected):
+        pod = k8s.V1Pod(
+            metadata=k8s.V1ObjectMeta(name="pod"),
+            status=k8s.V1PodStatus(
+                phase="Running",
+                conditions=[
+                    k8s.V1PodCondition(
+                        type="DisruptionTarget", status=status, reason="DeletionByTaintManager"
+                    )
+                ],
+            ),
+        )
+
+        assert collect_pod_failure_details(pod=pod, logger=logging.getLogger(__name__)) == expected
 
 
 class TestKubernetesExecutorMultiTeam:
@@ -5085,3 +5216,94 @@ class TestKubernetesExecutorUuid:
 
         assert watcher.call_args.kwargs["supports_task_instance_uuid"] is native
         watcher.return_value.start.assert_called_once_with()
+
+
+@pytest.mark.skipif(
+    not hasattr(BaseExecutor, "get_task_failure_info"), reason="Requires the executor failure-cause contract"
+)
+class TestKubernetesExecutorFailureCause:
+    @pytest.mark.parametrize(
+        ("failure_details", "expected"),
+        [
+            pytest.param(
+                {
+                    "pod_status": "Failed",
+                    "container_reason": "Error",
+                    "disruption_reason": "DeletionByTaintManager",
+                },
+                ("infra", "DeletionByTaintManager"),
+                id="taint-manager-deletion",
+            ),
+            pytest.param(
+                {"pod_status": "Running", "disruption_reason": "PreemptionByScheduler"},
+                ("infra", "PreemptionByScheduler"),
+                id="scheduler-preemption-while-running",
+            ),
+            pytest.param(
+                {
+                    "pod_status": "Failed",
+                    "pod_reason": "Evicted",
+                    "disruption_reason": "TerminationByKubelet",
+                },
+                ("infra", "TerminationByKubelet"),
+                id="kubelet-termination",
+            ),
+            pytest.param(
+                {"pod_status": "Failed", "pod_reason": "Terminated"},
+                ("infra", "Terminated"),
+                id="node-shutdown-without-condition",
+            ),
+            pytest.param(
+                {"pod_status": "Failed", "pod_reason": "Preempting"},
+                ("infra", "Preempting"),
+                id="kubelet-preemption-without-condition",
+            ),
+            pytest.param(
+                {"pod_status": "Failed", "pod_reason": "Evicted"},
+                (None, "Evicted"),
+                id="bare-eviction",
+            ),
+            pytest.param(
+                {"pod_status": "Failed", "container_reason": "OOMKilled", "exit_code": 137},
+                (None, "OOMKilled"),
+                id="oom-killed",
+            ),
+            pytest.param(
+                {
+                    "pod_status": "Failed",
+                    "container_reason": "Error",
+                    "disruption_reason": "EvictionByEvictionAPI",
+                },
+                (None, "EvictionByEvictionAPI"),
+                id="unlisted-disruption-reason",
+            ),
+            pytest.param(
+                {"pod_status": "Failed", "container_reason": "Preempting"},
+                (None, "Preempting"),
+                id="container-reason-is-not-a-pod-reason",
+            ),
+            pytest.param({"pod_status": "Failed"}, None, id="no-reason"),
+        ],
+    )
+    def test_failed_pod_reports_its_cause(self, failure_details, expected, mocker):
+        executor = KubernetesExecutor()
+        executor.kube_scheduler = mocker.create_autospec(AirflowKubernetesScheduler, instance=True)
+        key = TaskInstanceUuid(uuid4())
+        executor.running.add(key)
+
+        executor._change_state(
+            KubernetesResults(
+                key=key,
+                state=State.FAILED,
+                pod_name="pod",
+                namespace="ns",
+                resource_version="1",
+                failure_details=failure_details,
+            ),
+            session=mocker.create_autospec(Session, instance=True),
+        )
+
+        info = f"Pod failed because of {failure_details.get('pod_reason')}"
+        assert executor.event_buffer == {key: (State.FAILED, info)}
+        assert executor.running == set()
+        assert executor.get_task_failure_info(key) == expected
