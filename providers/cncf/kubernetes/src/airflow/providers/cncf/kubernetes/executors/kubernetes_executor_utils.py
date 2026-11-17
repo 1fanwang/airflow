@@ -63,6 +63,10 @@ from airflow.utils.state import TaskInstanceState
 if hasattr(BaseExecutor, "get_task_key"):
     from airflow.executors.workloads.types import TaskInstanceUuid
 
+_SUPPORTS_FAILURE_CAUSE: bool = hasattr(BaseExecutor, "get_task_failure_info")
+if _SUPPORTS_FAILURE_CAUSE:
+    from airflow.executors.base_executor import TaskFailureKind
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -369,12 +373,12 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
                 )
                 self.watcher_queue.put(
                     KubernetesWatch(
-                        pod_name,
-                        namespace,
-                        TaskInstanceState.FAILED,
-                        annotations,
-                        resource_version,
-                        None,
+                        pod_name=pod_name,
+                        namespace=namespace,
+                        state=TaskInstanceState.FAILED,
+                        annotations=annotations,
+                        resource_version=resource_version,
+                        failure_details=collect_pod_failure_details(pod=pod, logger=self.log),
                     )
                 )
             else:
@@ -393,7 +397,7 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
 
 def collect_pod_failure_details(pod: k8s.V1Pod, logger) -> FailureDetails | None:
     """
-    Collect detailed failure information from a failed pod.
+    Collect detailed failure information from a failed pod or a pod marked as a disruption target.
 
     Analyzes both init containers and main containers to determine the root cause
     of pod failure, prioritizing terminated containers with non-zero exit codes.
@@ -405,16 +409,23 @@ def collect_pod_failure_details(pod: k8s.V1Pod, logger) -> FailureDetails | None
     Returns:
         FailureDetails dict with failure information, or None if no failure details found
     """
-    if not pod.status or pod.status.phase != "Failed":
+    if not pod.status:
         return None
 
     try:
+        disruption_reason = _get_disruption_target_reason(pod.status)
+        if pod.status.phase != "Failed" and disruption_reason is None:
+            return None
+
         # Basic pod-level information
         failure_details: FailureDetails = {
             "pod_status": getattr(pod.status, "phase", None),
             "pod_reason": getattr(pod.status, "reason", None),
             "pod_message": getattr(pod.status, "message", None),
+            "disruption_reason": disruption_reason,
         }
+        if pod.status.phase != "Failed":
+            return failure_details
 
         # Check init containers first (they run before main containers)
         container_failure = _analyze_init_containers(pod.status)
@@ -441,6 +452,60 @@ def collect_pod_failure_details(pod: k8s.V1Pod, logger) -> FailureDetails | None
             "pod_reason": getattr(pod.status, "reason", None),
             "pod_message": getattr(pod.status, "message", None),
         }
+
+
+# Copied because the Kubernetes Python client does not export DisruptionTarget values:
+# https://kubernetes.io/docs/concepts/workloads/pods/disruptions/#pod-disruption-conditions
+# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/staging/src/k8s.io/api/core/v1/types.go#L3751-L3753
+# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/staging/src/k8s.io/api/core/v1/types.go#L3786-L3792
+# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/controller/tainteviction/taint_eviction.go#L135-L141
+# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/controller/podgc/gc_controller.go#L253-L259
+_DISRUPTION_TARGET_REASONS: frozenset[str] = frozenset(
+    {
+        "PreemptionByScheduler",
+        "TerminationByKubelet",
+        "DeletionByTaintManager",
+        "DeletionByPodGC",
+    }
+)
+
+# Needed because kubelets without pod disruption conditions mark node shutdown only with this pod reason:
+# https://kubernetes.io/docs/concepts/cluster-administration/node-shutdown/
+# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/nodeshutdown/nodeshutdown_manager.go#L159-L165
+# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/nodeshutdown/nodeshutdown_manager.go#L88
+_INFRA_POD_REASONS: frozenset[str] = frozenset({"Terminated"})
+
+
+def _get_disruption_target_reason(pod_status: k8s.V1PodStatus) -> str | None:
+    for condition in getattr(pod_status, "conditions", None) or []:
+        if condition.type == "DisruptionTarget" and condition.status == "True":
+            return condition.reason
+    return None
+
+
+def classify_pod_failure(
+    failure_details: FailureDetails,
+) -> tuple[TaskFailureKind | None, str | None] | None:
+    """
+    Return the failure kind and reason to report for a failed pod, or ``None`` if there are none.
+
+    Only the documented disruption signals above are ``infra``; other reasons are reported without a kind.
+    """
+    if not _SUPPORTS_FAILURE_CAUSE:
+        return None
+    disruption_reason = failure_details.get("disruption_reason")
+    pod_reason = failure_details.get("pod_reason")
+    # Node-pressure evictions also use TerminationByKubelet but often remove the pod causing the pressure:
+    # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/eviction/eviction_manager.go#L439-L447
+    # https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/eviction/helpers.go#L43-L44
+    if disruption_reason == "TerminationByKubelet" and pod_reason == "Evicted":
+        return None, pod_reason
+    if disruption_reason in _DISRUPTION_TARGET_REASONS:
+        return TaskFailureKind.INFRA, disruption_reason
+    if pod_reason in _INFRA_POD_REASONS:
+        return TaskFailureKind.INFRA, pod_reason
+    reason = disruption_reason or pod_reason or failure_details.get("container_reason")
+    return (None, reason) if reason else None
 
 
 def _analyze_containers(
