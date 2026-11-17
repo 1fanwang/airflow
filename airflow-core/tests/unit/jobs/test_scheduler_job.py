@@ -11544,6 +11544,7 @@ class TestSchedulerJob:
         assert current is not None
         assert (current.state, current.max_tries) == (TaskInstanceState.SUCCESS, 0)
 
+    @conf_vars({("core", "max_infra_retries"): "1"})
     def test_executor_events_for_finished_task_instances_reread_no_rows(
         self, dag_maker: DagMaker, session: Session
     ) -> None:
@@ -11565,6 +11566,50 @@ class TestSchedulerJob:
         assert count_event_queries(dag_id="finished_one", num_tasks=1) == count_event_queries(
             dag_id="finished_many", num_tasks=10
         )
+
+    @pytest.mark.parametrize("failure_kind", [None, TaskFailureKind.INFRA], ids=["unclassified", "infra"])
+    @mock.patch("airflow._shared.observability.metrics.stats._get_backend")
+    def test_executor_failure_with_infra_retries_disabled_adds_no_query(
+        self,
+        mock_get_backend: mock.MagicMock,
+        dag_maker: DagMaker,
+        session: Session,
+        failure_kind: TaskFailureKind | None,
+    ) -> None:
+        backend = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = backend
+
+        def fail_running_task(
+            dag_id: str, max_infra_retries: str, kind: TaskFailureKind | None
+        ) -> tuple[int, tuple[str | None, int]]:
+            with conf_vars({("core", "max_infra_retries"): max_infra_retries}):
+                with dag_maker(dag_id=dag_id, session=session):
+                    EmptyOperator(task_id="task", retries=0)
+                dag_run = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+                ti = dag_run.get_task_instance(task_id="task", session=session)
+                assert ti is not None
+                ti.state = TaskInstanceState.RUNNING
+                ti.try_number = 1
+                session.commit()
+                executor = MockExecutor(do_update=False)
+                self.job_runner = SchedulerJobRunner(Job(), executors=[executor])
+                executor.fail(key=TaskInstanceUuid(ti.id), failure_kind=kind)
+                with count_queries(session=session) as result:
+                    self.job_runner._process_executor_events(executor=executor, session=session)
+                current = dag_run.get_task_instance(task_id="task", session=session)
+                assert current is not None
+                return sum(result.values()), (current.state, current.max_tries)
+
+        disabled_queries, disabled_outcome = fail_running_task(
+            dag_id="infra_retry_disabled", max_infra_retries="0", kind=failure_kind
+        )
+        enabled_queries, _ = fail_running_task(dag_id="infra_retry_enabled", max_infra_retries="1", kind=None)
+
+        assert disabled_outcome == (TaskInstanceState.FAILED, 0)
+        assert enabled_queries == disabled_queries + 1
+        assert not [
+            call.args[0] for call in backend.incr.call_args_list if call.args[0].startswith("ti_infra_retry_")
+        ]
 
     @pytest.mark.parametrize(
         ("dag_run_bv", "dag_version_bv", "expected_bv"),

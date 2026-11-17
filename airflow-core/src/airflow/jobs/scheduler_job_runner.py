@@ -1699,6 +1699,7 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         # multi-schedulers
         locked_query = with_row_locks(query, of=TI, session=session, skip_locked=True)
         tis: Iterator[TI] = session.scalars(locked_query.execution_options(populate_existing=True))
+        infra_retries_enabled: bool = conf.getint("core", "max_infra_retries") > 0
         for ti in tis:
             buffer_key = TaskInstanceUuid(ti.id)
             try_number = ti.try_number
@@ -1713,8 +1714,13 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 cls.logger().info("Setting external_executor_id for %s to %s", ti, info)
                 continue
 
-            if ti.state in (TaskInstanceState.SCHEDULED, TaskInstanceState.QUEUED, TaskInstanceState.RUNNING):
-                # Handling an earlier failure in this batch commits, releasing the row locks taken above.
+            if infra_retries_enabled and ti.state in (
+                TaskInstanceState.SCHEDULED,
+                TaskInstanceState.QUEUED,
+                TaskInstanceState.RUNNING,
+            ):
+                # The infrastructure retry decision needs the current row, but handling an earlier
+                # failure in this batch commits and releases the row locks taken above.
                 ti.refresh_from_db(session=session, lock_for_update=True)
 
             msg = (
