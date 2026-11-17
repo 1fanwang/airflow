@@ -35,8 +35,10 @@ from multiprocessing import cpu_count
 from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
 
 from celery import states as celery_states
+from celery.exceptions import WorkerLostError
 
 from airflow.executors.base_executor import BaseExecutor
+from airflow.models.taskinstancekey import TaskInstanceKey
 from airflow.providers.celery.executors import (
     celery_executor_utils as _celery_executor_utils,  # noqa: F401 # Needed to register Celery tasks at worker startup, see #63043.
 )
@@ -50,10 +52,15 @@ if AIRFLOW_V_3_4_PLUS:
 
     _SUPPORTED_WORKLOAD_TYPES = frozenset({WorkloadType.EXECUTE_TASK, WorkloadType.EXECUTE_CALLBACK})
 
+if hasattr(BaseExecutor, "get_task_key"):
+    # Back-compat: TaskInstanceUuid exists only where BaseExecutor.get_task_key does.
+    from airflow.executors.workloads.types import TaskInstanceUuid
+
 log = logging.getLogger(__name__)
 
 
 CELERY_SEND_ERR_MSG_HEADER = "Error sending Celery workload"
+WORKER_LOST_REASON: str = "WorkerLost"
 
 
 if TYPE_CHECKING:
@@ -64,7 +71,6 @@ if TYPE_CHECKING:
     from airflow.cli.cli_config import GroupCommand
     from airflow.executors import workloads
     from airflow.models.taskinstance import TaskInstance
-    from airflow.models.taskinstancekey import TaskInstanceKey
     from airflow.providers.celery.executors.celery_executor_utils import TaskTuple, WorkloadInCelery
 
     if AIRFLOW_V_3_2_PLUS:
@@ -303,6 +309,15 @@ class CeleryExecutor(BaseExecutor):
             if state == celery_states.SUCCESS:
                 self.success(key, info)
             elif state in (celery_states.FAILURE, celery_states.REVOKED):
+                if (
+                    # A version check would fail on Airflow 3.4, whose fail() has no reason parameter.
+                    hasattr(self, "get_task_failure_info")
+                    and isinstance(info, WorkerLostError)
+                    and isinstance(key, (TaskInstanceUuid, TaskInstanceKey))
+                ):
+                    # AIP-97: worker loss alone does not establish an infrastructure cause.
+                    self.fail(key=key, info=info, reason=WORKER_LOST_REASON)
+                    return
                 self.fail(key, info)
             elif state in (celery_states.STARTED, celery_states.PENDING, celery_states.RETRY):
                 pass

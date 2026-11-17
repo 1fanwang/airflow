@@ -378,3 +378,13 @@ CeleryExecutor uses task-instance UUIDs for scheduler bookkeeping when the Airfl
 them, including adoption and revocation. Celery's external task identifier remains the
 transport identity, so existing work can be adopted after a scheduler upgrade. Older
 supported Airflow versions retain coordinate keys; the provider's minimum Airflow version is unchanged.
+
+Worker loss
+-----------
+
+When a worker child process exits while it runs a task, for example after ``SIGKILL``, Celery records
+``WorkerLostError`` in the result backend unless ``task_reject_on_worker_lost`` requeues the task. When
+the Airflow version supports executor failure reasons, CeleryExecutor reports such a failure with the
+reason ``WorkerLost`` and no failure category, because a lost worker does not establish an
+infrastructure cause. Failure listeners and scheduler logs receive the reason; retries are unchanged.
+See :doc:`apache-airflow:administration-and-deployment/listeners`.
