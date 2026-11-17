@@ -28,7 +28,7 @@ Connections choose the model
 
 ``common.ai`` is built on `pydantic-ai <https://ai.pydantic.dev/>`__, so the model vendor
 (OpenAI, Anthropic, Google, Bedrock, …) is picked by the connection ``llm_conn_id`` points
-at — switching providers later is a connection change, not a Dag rewrite. Most connections
+at, so switching providers later is a connection change, not a Dag rewrite. Most connections
 use the generic ``pydanticai`` type, but Azure OpenAI, Bedrock, and Vertex AI also have their
 own connection types (``pydanticai_azure``, ``pydanticai_bedrock``, ``pydanticai_vertex``) for
 provider-specific authentication.
@@ -49,7 +49,7 @@ generating SQL, comparing schemas, or submitting many prompts as one batch.
 
 The AI step is orchestrated by Airflow: the model calls, the agent loop, and any tools
 run in the Airflow worker by default, where they get retries, logging, and observability like
-any other task. The exception is :ref:`SandboxToolset <sandbox-limitations>`, which exists so
+any other task. The exception is :ref:`SandboxToolset <sandbox-placement>`, which exists so
 that code the *model* writes runs somewhere else.
 
 Toolsets give agents reach
@@ -65,7 +65,7 @@ Existing LangChain tools are not locked out either: pydantic-ai ships
 ``pydantic_ai.ext.langchain.LangChainToolset`` upstream, which wraps LangChain tools for a
 common.ai agent, and the provider's own
 :func:`~airflow.providers.common.ai.toolsets.langchain_bridge.airflow_toolset_to_langchain_tools`
-converts the other way — Airflow-managed toolsets into LangChain tools (see
+converts the other way, from Airflow-managed toolsets into LangChain tools (see
 :doc:`toolsets/langchain`).
 
 Hooks are the plumbing underneath
@@ -110,7 +110,7 @@ Results flow through XCom
 
 Every operator pushes its result to XCom like any other task. A plain string arrives as a
 string. A Pydantic ``output_type`` arrives as the model instance, typed, so a downstream
-task can use attribute access. :doc:`structured_output` explains how the class is
+task can use attribute access (a model inside a list of types arrives as a ``dict``). :doc:`structured_output` explains how the class is
 registered for deserialization and where that stops working.
 
 Related providers
@@ -119,15 +119,15 @@ Related providers
 Use a vendor's own provider instead when the Dag needs that vendor's **native API surface**, a
 service the vendor runs for you, which no vendor-neutral operator wraps:
 
-* :doc:`apache-airflow-providers-openai:index` — the Embeddings and Responses APIs, and Batch
+* :doc:`apache-airflow-providers-openai:index`: the Embeddings and Responses APIs, and Batch
   jobs built from a pre-uploaded JSONL file of raw request bodies.
-* :doc:`apache-airflow-providers-anthropic:index` — Message Batches built from raw Messages
+* :doc:`apache-airflow-providers-anthropic:index`: Message Batches built from raw Messages
   API request bodies (multi-turn, images, tools), and Managed Agents sessions where the agent
   loop runs on Anthropic's infrastructure rather than in the Airflow worker.
-* :doc:`apache-airflow-providers-cohere:index` — Cohere's own Embed API.
-* :doc:`apache-airflow-providers-google:index` — Vertex AI's Batch Prediction jobs
+* :doc:`apache-airflow-providers-cohere:index`: Cohere's own Embed API.
+* :doc:`apache-airflow-providers-google:index`: Vertex AI's Batch Prediction jobs
   (``CreateBatchPredictionJobOperator``), a managed batch service like OpenAI's Batch API.
-* :doc:`apache-airflow-providers-amazon:index` — Bedrock's Batch Inference
+* :doc:`apache-airflow-providers-amazon:index`: Bedrock's Batch Inference
   (``BedrockBatchInferenceOperator``), and Bedrock AgentCore's managed agent runtime
   (``BedrockCreateAgentRuntimeOperator`` / ``BedrockInvokeAgentRuntimeOperator``), where the
   agent loop runs on AWS's infrastructure rather than in the Airflow worker.

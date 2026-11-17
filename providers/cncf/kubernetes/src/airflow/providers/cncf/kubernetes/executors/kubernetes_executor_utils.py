@@ -23,46 +23,52 @@ import multiprocessing
 import time
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Literal, cast
+from uuid import UUID
 
 from kubernetes import client, watch
 from kubernetes.client.rest import ApiException
 from kubernetes_asyncio import client as async_client
 from urllib3.exceptions import ReadTimeoutError
 
+from airflow.executors.base_executor import BaseExecutor
 from airflow.providers.cncf.kubernetes.backcompat import get_logical_date_key
 from airflow.providers.cncf.kubernetes.executors.kubernetes_executor_types import (
     ADOPTED,
     ALL_NAMESPACES,
     POD_EXECUTOR_DONE_KEY,
     POD_REVOKED_KEY,
+    TASK_INSTANCE_ID_ANNOTATION,
+    TASK_INSTANCE_ID_LABEL,
     FailureDetails,
     KubernetesJob,
     KubernetesResults,
     KubernetesWatch,
+    task_instance_id_from_pod,
 )
-from airflow.providers.cncf.kubernetes.kube_client import get_async_kube_client, get_kube_client
+from airflow.providers.cncf.kubernetes.kube_client import (
+    _get_executor_async_kube_client,
+    _get_executor_kube_client,
+)
 from airflow.providers.cncf.kubernetes.kubernetes_helper_functions import (
     annotations_for_logging_task_metadata,
     annotations_to_key,
     create_unique_id,
 )
 from airflow.providers.cncf.kubernetes.pod_generator import PodGenerator, workload_to_command_args
-from airflow.providers.cncf.kubernetes.version_compat import AIRFLOW_V_3_4_PLUS
 from airflow.providers.common.compat.sdk import AirflowException, Stats
 from airflow.utils.helpers import prune_dict
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.state import TaskInstanceState
 
+if hasattr(BaseExecutor, "get_task_key"):
+    from airflow.executors.workloads.types import TaskInstanceUuid
+
 if TYPE_CHECKING:
-    import logging
     from collections.abc import Iterator
 
     from kubernetes.client import Configuration, models as k8s
-    from structlog.typing import FilteringBoundLogger
 
-if AIRFLOW_V_3_4_PLUS or TYPE_CHECKING:
-    # Older supported Airflow versions lack this enum.
-    from airflow.executors.base_executor import TaskFailureKind
+    from airflow.models.taskinstancekey import TaskInstanceKey
 
 
 class ResourceVersion:
@@ -87,6 +93,9 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
         resource_version: str | None,
         scheduler_job_id: str,
         kube_config: Configuration,
+        supports_task_instance_uuid: bool = False,
+        team_name: str | None = None,
+        client_factory: str | None = None,
     ):
         super().__init__()
         self.namespace = namespace
@@ -94,13 +103,20 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
         self.watcher_queue = watcher_queue
         self.resource_version = resource_version
         self.kube_config = kube_config
+        self.supports_task_instance_uuid = supports_task_instance_uuid
+        # Strings survive the spawn start method, so the watcher can build its team's client in its
+        # own process.
+        self.team_name = team_name
+        self.client_factory = client_factory
 
     def run(self) -> None:
         """Perform watching."""
         if TYPE_CHECKING:
             assert self.scheduler_job_id
 
-        kube_client: client.CoreV1Api = get_kube_client()
+        kube_client: client.CoreV1Api = _get_executor_kube_client(
+            team_name=self.team_name, executor_client_factory=self.client_factory
+        )
         while True:
             try:
                 self.resource_version = self._run(
@@ -179,6 +195,13 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
                 "run_id": annotations.get("run_id"),
                 "try_number": annotations["try_number"],
             }
+            if TASK_INSTANCE_ID_ANNOTATION in annotations:
+                task_instance_related_annotations[TASK_INSTANCE_ID_ANNOTATION] = annotations[
+                    TASK_INSTANCE_ID_ANNOTATION
+                ]
+            elif self.supports_task_instance_uuid:
+                if identity := task_instance_id_from_pod(task):
+                    task_instance_related_annotations[TASK_INSTANCE_ID_ANNOTATION] = str(identity)
             map_index = annotations.get("map_index")
             if map_index is not None:
                 task_instance_related_annotations["map_index"] = map_index
@@ -346,12 +369,12 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
                 )
                 self.watcher_queue.put(
                     KubernetesWatch(
-                        pod_name=pod_name,
-                        namespace=namespace,
-                        state=TaskInstanceState.FAILED,
-                        annotations=annotations,
-                        resource_version=resource_version,
-                        failure_details=collect_pod_failure_details(pod=pod, logger=self.log),
+                        pod_name,
+                        namespace,
+                        TaskInstanceState.FAILED,
+                        annotations,
+                        resource_version,
+                        None,
                     )
                 )
             else:
@@ -368,38 +391,30 @@ class KubernetesJobWatcher(multiprocessing.Process, LoggingMixin):
             )
 
 
-def _get_disruption_target_reason(pod_status: k8s.V1PodStatus) -> str | None:
-    """Read a current disruption reason; a false condition can retain a stale reason."""
-    for condition in getattr(pod_status, "conditions", None) or []:
-        if (
-            getattr(condition, "type", None) == "DisruptionTarget"
-            and getattr(condition, "status", None) == "True"
-        ):
-            return getattr(condition, "reason", None)
-    return None
+def collect_pod_failure_details(pod: k8s.V1Pod, logger) -> FailureDetails | None:
+    """
+    Collect detailed failure information from a failed pod.
 
+    Analyzes both init containers and main containers to determine the root cause
+    of pod failure, prioritizing terminated containers with non-zero exit codes.
 
-def collect_pod_failure_details(
-    pod: k8s.V1Pod, logger: logging.Logger | FilteringBoundLogger
-) -> FailureDetails | None:
-    """Collect failure details, including disruption conditions reported before termination."""
-    if not pod.status:
+    Args:
+        pod: The Kubernetes V1Pod object to analyze
+        logger: Logger instance to use for error logging
+
+    Returns:
+        FailureDetails dict with failure information, or None if no failure details found
+    """
+    if not pod.status or pod.status.phase != "Failed":
         return None
 
     try:
-        disruption_reason: str | None = _get_disruption_target_reason(pod.status)
-        if pod.status.phase != "Failed" and disruption_reason is None:
-            return None
-
         # Basic pod-level information
         failure_details: FailureDetails = {
             "pod_status": getattr(pod.status, "phase", None),
             "pod_reason": getattr(pod.status, "reason", None),
             "pod_message": getattr(pod.status, "message", None),
-            "disruption_reason": disruption_reason,
         }
-        if pod.status.phase != "Failed":
-            return failure_details
 
         # Check init containers first (they run before main containers)
         container_failure = _analyze_init_containers(pod.status)
@@ -426,54 +441,6 @@ def collect_pod_failure_details(
             "pod_reason": getattr(pod.status, "reason", None),
             "pod_message": getattr(pod.status, "message", None),
         }
-
-
-# The Python client exposes the fields, but not Kubernetes' reason constants:
-# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/preemption/preemption.go#L112-L117
-# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/kubelet/nodeshutdown/nodeshutdown_manager.go#L88-L89
-# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/util/node/node.go#L28-L31
-_INFRA_FAILURE_REASONS: frozenset[str] = frozenset(
-    {
-        "Preempting",
-        "Terminated",
-        "NodeLost",
-    }
-)
-
-# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/staging/src/k8s.io/api/core/v1/types.go#L3786-L3795
-# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/controller/tainteviction/taint_eviction.go#L134-L141
-# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/controller/podgc/gc_controller.go#L252-L259
-# https://github.com/kubernetes/kubernetes/blob/e81f39c0e03ce8ed8e2660c9147b391edd9e262b/pkg/controller/devicetainteviction/device_taint_eviction.go#L481-L486
-_DISRUPTION_TARGET_REASONS: frozenset[str] = frozenset(
-    {
-        "PreemptionByScheduler",
-        "TerminationByKubelet",
-        "DeletionByTaintManager",
-        "DeletionByPodGC",
-        "DeletionByDeviceTaintManager",
-    }
-)
-
-
-def classify_pod_failure(
-    failure_details: FailureDetails | None,
-) -> tuple[TaskFailureKind | None, str | None] | None:
-    """Return the pod's trusted failure kind and short reason, when available."""
-    if not failure_details or not AIRFLOW_V_3_4_PLUS:
-        return None
-
-    pod_reason = failure_details.get("pod_reason")
-    container_reason = failure_details.get("container_reason")
-    disruption_reason = failure_details.get("disruption_reason")
-
-    reason = disruption_reason or pod_reason or container_reason
-    if reason is None:
-        return None
-    if disruption_reason in _DISRUPTION_TARGET_REASONS:
-        return TaskFailureKind.INFRA, disruption_reason
-    if pod_reason in _INFRA_FAILURE_REASONS:
-        return TaskFailureKind.INFRA, pod_reason
-    return None, reason
 
 
 def _analyze_containers(
@@ -543,19 +510,26 @@ class AirflowKubernetesScheduler(LoggingMixin):
         kube_client: client.CoreV1Api,
         scheduler_job_id: str,
         team_name: str | None = None,
+        supports_task_instance_uuid: bool = False,
+        client_factory: str | None = None,
+        async_client_factory: str | None = None,
     ):
         super().__init__()
         self.log.debug("Creating Kubernetes executor")
         self.kube_config = kube_config
         self.result_queue = result_queue
+        self.supports_task_instance_uuid = supports_task_instance_uuid
         self.namespace = self.kube_config.kube_namespace
         self.log.debug("Kubernetes using namespace %s", self.namespace)
         self.kube_client = kube_client
         self._manager = multiprocessing.Manager()
         self.watcher_queue = self._manager.Queue()
         self.scheduler_job_id = scheduler_job_id
-        self.kube_watchers = self._make_kube_watchers()
+        # Set before the watchers are built, since they are told which team they are watching for.
         self.team_name = team_name
+        self.client_factory = client_factory
+        self.async_client_factory = async_client_factory
+        self.kube_watchers = self._make_kube_watchers()
         # Async pod-creation state; populated lazily, only used when async_pod_creation is enabled.
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._async_pod_client: async_client.CoreV1Api | None = None
@@ -605,6 +579,9 @@ class AirflowKubernetesScheduler(LoggingMixin):
             resource_version=resource_version,
             scheduler_job_id=self.scheduler_job_id,
             kube_config=self.kube_config,
+            supports_task_instance_uuid=self.supports_task_instance_uuid,
+            team_name=self.team_name,
+            client_factory=self.client_factory,
         )
         watcher.start()
         return watcher
@@ -659,12 +636,13 @@ class AirflowKubernetesScheduler(LoggingMixin):
         pod_template_file = next_job.pod_template_file
         kube_image = next_job.kube_image or self.kube_config.kube_image
 
-        dag_id, task_id, run_id, try_number, map_index = key
+        coordinates = cast("TaskInstanceKey", key)
         if len(command) == 1:
             from airflow.executors.workloads import ExecuteTask
 
             if isinstance(command[0], ExecuteTask):
                 workload = command[0]
+                coordinates = workload.ti.key
                 command = workload_to_command_args(workload)
             else:
                 raise ValueError(
@@ -673,6 +651,7 @@ class AirflowKubernetesScheduler(LoggingMixin):
         elif command[0:3] != ["airflow", "tasks", "run"]:
             raise ValueError('The command must start with ["airflow", "tasks", "run"].')
 
+        dag_id, task_id, run_id, try_number, map_index = coordinates
         base_worker_pod = get_base_pod_from_template(pod_template_file, self.kube_config)
 
         if not base_worker_pod:
@@ -696,6 +675,9 @@ class AirflowKubernetesScheduler(LoggingMixin):
             base_worker_pod=base_worker_pod,
             with_mutation_hook=True,
         )
+        if self.supports_task_instance_uuid and isinstance(key, TaskInstanceUuid):
+            pod.metadata.annotations[TASK_INSTANCE_ID_ANNOTATION] = str(key)
+            pod.metadata.labels[TASK_INSTANCE_ID_LABEL] = str(key)
         # Reconcile the pod generated by the Operator and the Pod
         # generated by the .cfg file
         self.log.info(
@@ -747,7 +729,9 @@ class AirflowKubernetesScheduler(LoggingMixin):
     ) -> list[Exception | None]:
         """Issue create_namespaced_pod calls concurrently, bounded by a semaphore; one result per pod, in order."""
         if self._async_pod_client is None:
-            self._async_pod_client = await get_async_kube_client()
+            self._async_pod_client = await _get_executor_async_kube_client(
+                team_name=self.team_name, executor_client_factory=self.async_client_factory
+            )
         api = self._async_pod_client
         semaphore = asyncio.Semaphore(self.pod_creation_max_concurrency)
         request_kwargs: dict[str, Any] = self.kube_config.kube_client_request_args or {}
@@ -896,7 +880,15 @@ class AirflowKubernetesScheduler(LoggingMixin):
             task.state,
             annotations_for_logging_task_metadata(task.annotations),
         )
-        key = annotations_to_key(annotations=task.annotations)
+        key: TaskInstanceUuid | TaskInstanceKey | None
+        if self.supports_task_instance_uuid and TASK_INSTANCE_ID_ANNOTATION in task.annotations:
+            try:
+                key = TaskInstanceUuid(UUID(task.annotations[TASK_INSTANCE_ID_ANNOTATION]))
+            except ValueError:
+                self.log.warning("Ignoring pod %s with invalid task instance UUID", task.pod_name)
+                return
+        else:
+            key = annotations_to_key(annotations=task.annotations)
         if key:
             self.log.debug("finishing job %s - %s (%s)", key, task.state, task.pod_name)
             self.result_queue.put(

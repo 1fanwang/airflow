@@ -17,11 +17,11 @@
 
 .. _howto/operator:llm_branch:
 
-Branch on an answer: ``LLMBranchOperator``
-==========================================
+Branch on an answer: ``LLMBranchOperator`` and ``@task.llm_branch``
+===================================================================
 
 Use :class:`~airflow.providers.common.ai.operators.llm_branch.LLMBranchOperator`
-for LLM-driven branching — where the LLM decides which downstream task(s) to
+for LLM-driven branching, where the LLM decides which downstream task(s) to
 execute.
 
 The operator discovers downstream tasks automatically from the Dag topology
@@ -79,13 +79,12 @@ misspelled key silently turning into an option with no description is
 exactly the problem this parameter exists to prevent. Descriptions support
 Jinja templating, and the mapping works with ``allow_multiple_branches=True``
 and with the ``@task.llm_branch`` decorator. Under the hood the options are
-pydantic-ai's ``Choices`` type (2.46+), or an equivalent enum on older
-releases, so the model can only answer with one of the task IDs.
+pydantic-ai's ``Choices`` type, or an equivalent enum on releases that predate
+it, so the model can only answer with one of the task IDs.
 
 Descriptions explain the choices; they do not make the model more certain,
 and a text model's structured output carries no confidence to read. With a
-classifier model such as TypeSafe's, the descriptions become the criteria of
-its choice question, which is the text it weighs each option by.
+decision model, the descriptions become the criteria of its choice question, which is the text it weighs each option by.
 
 A pick is relative: the model chooses the best fit among the downstream tasks
 offered, not whether any of them fits. If "none of these" or "not enough to
@@ -136,7 +135,7 @@ Set ``require_approval=True`` to pause the task after the LLM chooses the
 branch(es) and wait for a human reviewer to approve the choice before any
 downstream task is skipped. The review form shows the LLM's choice and the
 valid downstream task IDs. When ``allow_modifications=True``, the reviewer
-can also change the choice — rendered as a dropdown of the downstream task
+can also change the choice, rendered as a dropdown of the downstream task
 IDs, or a multi-select of them with ``allow_multiple_branches=True``. The
 reviewed branch(es) are validated
 against the downstream task IDs before branching:
@@ -159,20 +158,20 @@ skipped too. Letting ``approval_timeout`` expire fails the task
 (``HITLTimeoutError``) unless ``on_approval_timeout`` answers the review for
 you; a timeout-driven rejection then skips downstream like any other rejection.
 
-``require_approval=True`` requires a string prompt: a decorated callable
-returning a ``Sequence[UserContent]`` raises ``TypeError`` before the LLM
-call.
-
-Apart from ``fail_on_reject`` and ``ignore_downstream_trigger_rules``, which
-are specific to this operator, ``approval_timeout``, ``on_approval_timeout``,
+Apart from ``fail_on_reject``, which defaults to ``False`` here and to ``True``
+on other operators, ``approval_timeout``, ``on_approval_timeout``,
 ``approval_notifiers``, ``approval_assigned_users``, and the rest of the approval
 behaviour are inherited from :ref:`LLMOperator <howto/operator:llm>`.
 
 Reviewing Uncertain Picks
 -------------------------
 
-A classifier model such as TypeSafe's returns a confidence with every pick,
-a number from 0 to 1 that summarizes how concentrated its probability
+.. note::
+
+    Experimental: this can change or be removed in a minor release of this provider.
+    See :ref:`howto/stability`.
+
+A decision model returns a confidence with every pick, a number from 0 to 1 that summarizes how concentrated its probability
 distribution was: near 1 when one branch stood out, low when two or more
 were close. It is not the probability that the pick is right. It is the
 model saying how clear-cut the question was, and it is the signal you gate on.
@@ -219,21 +218,21 @@ Four situations, each with a defined outcome:
 
 Without a ``min_confidence`` on the policy nothing here applies and the
 operator behaves as before. ``on_uncertain="review"`` needs Airflow 3.1+, like
-``require_approval``, and is rejected at construction on an older core. The
+``require_approval``, and is rejected at construction on an older Airflow version. The
 review it opens is the same one ``require_approval`` opens: ``approval_timeout``,
 ``on_approval_timeout``, ``allow_modifications``, ``approval_notifiers`` and
 ``approval_assigned_users`` all apply to it.
 
-TypeSafe's models need pydantic-ai 2.45 or later with its ``typesafe`` extra
-(``pip install "pydantic-ai-slim[typesafe]"``) and a ``pydanticai`` connection
-whose Model is ``typesafe:jev-1.13.0`` (or the ``model_id`` on the operator, as
-in the example).
+The example reads a ``pydanticai`` connection, ``decision_default``, whose Model is a decision
+model: ``typesafe:jev-1.13.0`` for TypeSafe's Jev, or ``system-one:<model>`` for a server
+answering the System One API. :doc:`../decision_models` covers the setup for each.
 
 The decision record
-~~~~~~~~~~~~~~~~~~~
+^^^^^^^^^^^^^^^^^^^
 
 Whether or not a bar is set, the operator pushes a ``decision`` XCom next to
-its return value (suppressed by ``do_xcom_push=False`` like any other):
+its return value and the run XComs listed under `Logging`_ (suppressed by
+``do_xcom_push=False`` like any other):
 
 .. code-block:: json
 
@@ -280,8 +279,8 @@ How It Works
 At execution time, the operator:
 
 1. Reads ``self.downstream_task_ids`` from the Dag topology.
-2. Builds the option type (pydantic-ai's ``Choices`` on 2.46+, an equivalent
-   enum before) with one option per downstream task ID, in sorted order so every
+2. Builds the option type (pydantic-ai's ``Choices``, or an equivalent enum on
+   releases that predate it) with one option per downstream task ID, in sorted order so every
    worker presents the options the same way. With
    descriptions in ``branches``, the schema is an ``anyOf`` of ``{"const":
    <task_id>, "description": <text>}`` entries, which is the one schema shape that
@@ -289,7 +288,7 @@ At execution time, the operator:
 3. Passes that type as ``output_type`` to ``pydantic-ai``, constraining the LLM
    to valid task IDs only.
 4. Reads the model's confidence for the pick from ``provider_details`` (a
-   classifier model reports one; a text model does not), pushes the
+   decision model reports one; a text model does not), pushes the
    ``decision`` XCom, and if the ``decision_policy`` or ``require_approval`` says
    so, pauses for human review (or fails, with ``on_uncertain="fail"``).
 5. Converts the LLM's structured output to task ID string(s) and calls
@@ -311,8 +310,10 @@ Parameters
   Jinja templating. Default ``None``.
 - ``allow_multiple_branches``: When ``False`` (default) the LLM returns a single
   task ID. When ``True`` the LLM may return one or more task IDs.
-- ``agent_params``: Additional keyword arguments passed to the pydantic-ai ``Agent``
-  constructor (e.g. ``retries``, ``model_settings``). Supports Jinja templating.
+- ``model_settings``: Pydantic AI ``ModelSettings`` for the model call, such as
+  ``temperature`` or ``max_tokens``. Supports Jinja templating.
+- ``output_retries``: How many times the model is asked again when its output fails
+  validation. Default ``None`` (Pydantic AI's default).
 - ``usage_limits``: Optional pydantic-ai ``UsageLimits`` (or a templated ``dict`` of
   the same fields) enforced on the run; the task fails when a budget is exceeded.
   Default ``None``. See :ref:`Usage Limits <howto/operator:llm_usage_limits>`.
@@ -348,5 +349,8 @@ Logging
 -------
 
 After each LLM call, the operator logs a summary with model name, token usage,
-and request count at INFO level. See :ref:`AgentOperator — Logging <howto/operator:agent>`
+and request count at INFO level. See :ref:`AgentOperator logging <howto/operator:agent>`
 for details on the log format.
+
+Like :doc:`llm`, the operator also pushes ``usage``, ``run_id`` and the model name to
+XCom, on a failed run too. See :doc:`../observability`.
