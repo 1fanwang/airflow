@@ -36,8 +36,10 @@ from airflow.providers.dbt.cloud.hooks.dbt import (
     DbtCloudJobRunException,
     DbtCloudJobRunStatus,
     DbtCloudResourceLookupError,
+    DbtCloudTriggerEventException,
     TokenAuth,
     fallback_to_default_account,
+    validate_execute_complete_event,
 )
 
 from tests_common.test_utils.compat import timezone
@@ -157,6 +159,34 @@ class TestDbtCloudJobRunStatus:
     def test_invalid_terminal_job_run_status(self, statuses):
         with pytest.raises(ValueError, match=NOT_VAILD_DBT_STATUS):
             DbtCloudJobRunStatus.check_is_valid(statuses)
+
+
+class TestValidateExecuteCompleteEvent:
+    @pytest.mark.parametrize(
+        ("event", "match"),
+        [
+            pytest.param(None, "event is None", id="none"),
+            pytest.param({}, "Unexpected trigger event status None", id="missing-status"),
+            pytest.param(
+                {"status": "ended", "run_id": 1234}, "Unexpected trigger event status", id="unknown-status"
+            ),
+        ],
+    )
+    def test_invalid_event_raises(self, event, match):
+        with pytest.raises(DbtCloudTriggerEventException, match=match):
+            validate_execute_complete_event(event)
+
+    @pytest.mark.parametrize(
+        "event",
+        [
+            pytest.param({"status": "success", "run_id": 1234, "message": "ok"}, id="success"),
+            pytest.param({"status": "cancelled", "run_id": 1234, "message": "cancelled"}, id="cancelled"),
+            pytest.param({"status": "error", "run_id": 1234, "message": "failed"}, id="error"),
+            pytest.param({"status": "timeout", "run_id": 1234, "message": "timed out"}, id="timeout"),
+        ],
+    )
+    def test_valid_event_is_returned(self, event):
+        assert validate_execute_complete_event(event) is event
 
 
 class TestDbtCloudHook:
@@ -1402,6 +1432,19 @@ class TestDbtCloudHook:
         assert extra_options["timeout"] == timeout_seconds
         assert "proxies" in extra_options
         assert extra_options["proxies"] == EXTRA_PROXIES["proxies"]
+
+    def test_timeout_and_proxies_reach_the_request(self, requests_mock):
+        """timeout_seconds and connection proxies are applied to the sent request."""
+        requests_mock.get(
+            f"{SINGLE_TENANT_URL}api/v2/accounts/{DEFAULT_ACCOUNT_ID}/jobs/{JOB_ID}",
+            json={"data": {"id": JOB_ID}},
+        )
+        hook = DbtCloudHook(PROXY_CONN, timeout_seconds=60)
+
+        hook.get_job(job_id=JOB_ID, account_id=DEFAULT_ACCOUNT_ID)
+
+        assert requests_mock.last_request.timeout == 60
+        assert requests_mock.last_request.proxies.get("https") == EXTRA_PROXIES["proxies"]["https"]
 
     @pytest.mark.parametrize(
         argnames=("exception", "expected"),
