@@ -37,6 +37,7 @@ from botocore.exceptions import ClientError, NoCredentialsError
 
 from airflow.exceptions import AirflowProviderDeprecationWarning
 from airflow.executors.base_executor import BaseExecutor
+from airflow.models.taskinstancekey import TaskInstanceKey
 from airflow.providers.amazon.aws.executors.ecs.boto_schema import BotoDescribeTasksSchema, BotoRunTaskSchema
 from airflow.providers.amazon.aws.executors.ecs.utils import (
     CONFIG_DEFAULTS,
@@ -64,12 +65,16 @@ from airflow.utils.state import State
 if AIRFLOW_V_3_4_PLUS:
     from airflow.executors.workloads.base import WorkloadType
 
+_SUPPORTS_FAILURE_CAUSE: bool = hasattr(BaseExecutor, "get_task_failure_info")
+if _SUPPORTS_FAILURE_CAUSE:
+    from airflow.executors.base_executor import TaskFailureKind
+    from airflow.executors.workloads.types import TaskInstanceUuid
+
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
-    from airflow._shared.state import TaskFailureKind
     from airflow.executors import workloads
-    from airflow.models.taskinstance import TaskInstance, TaskInstanceKey
+    from airflow.models.taskinstance import TaskInstance
     from airflow.providers.amazon.aws.executors.ecs.utils import (
         CommandType,
         ExecutorConfigType,
@@ -92,22 +97,9 @@ THROTTLING_EXCEPTIONS = ["ThrottlingException"]
 # ``max_run_task_attempts``, so a workload cannot stay pending for as long as the throttling lasts.
 MAX_THROTTLED_RUN_TASK_RETRIES = 5
 
-# https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_Task.html
 # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/spot-interruption-errors.html
-STOP_CODE_SPOT_INTERRUPTION = "SpotInterruption"
-
-
-def classify_ecs_failure(stop_code: str | None) -> tuple[TaskFailureKind | None, str | None]:
-    """Map an ECS stop code to the shared failure contract."""
-    if not AIRFLOW_V_3_4_PLUS:
-        return None, None
-
-    from airflow._shared.state import TaskFailureKind
-
-    if stop_code == STOP_CODE_SPOT_INTERRUPTION:
-        return TaskFailureKind.INFRA, STOP_CODE_SPOT_INTERRUPTION
-
-    return None, stop_code
+# https://github.com/boto/botocore/blob/ece3056055b8891b9a3a57fee4017f37cca19907/botocore/data/ecs/2014-11-13/service-2.json#L12251-L12262
+_SPOT_INTERRUPTION_STOP_CODE = "SpotInterruption"
 
 
 class AwsEcsExecutor(BaseExecutor):
@@ -387,7 +379,9 @@ class AwsEcsExecutor(BaseExecutor):
         # Mark finished tasks as either a success/failure.
         if task_state == State.FAILED or task_state == State.REMOVED:
             self.__log_container_failures(task_arn=task.task_arn)
-            self.__handle_failed_workload(task.task_arn, task.stopped_reason, task.stop_code)
+            self.__handle_failed_workload(
+                task_arn=task.task_arn, reason=task.stopped_reason, stop_code=task.stop_code
+            )
         elif task_state == State.SUCCESS:
             self.log.debug(
                 "Airflow workload %s marked as %s after running on ECS Task (arn) %s",
@@ -428,10 +422,7 @@ class AwsEcsExecutor(BaseExecutor):
             )
 
     def __handle_failed_workload(
-        self,
-        task_arn: str,
-        reason: str | None,
-        stop_code: str | None = None,
+        self, task_arn: str, reason: str | None, stop_code: str | None = None
     ) -> None:
         """
         If an API failure occurs, the workload is rescheduled.
@@ -467,26 +458,17 @@ class AwsEcsExecutor(BaseExecutor):
                 )
             )
         else:
-            failure_kind: TaskFailureKind | None = None
-            failure_reason: str | None = None
-            is_task_instance = False
-            if AIRFLOW_V_3_4_PLUS:
-                # The provider still imports on Airflow versions without the cause contract.
-                from airflow.models.taskinstancekey import TaskInstanceKey
-
-                is_task_instance = isinstance(task_key, TaskInstanceKey)
-            if is_task_instance:
-                failure_kind, failure_reason = classify_ecs_failure(stop_code)
             self.log.error(
-                "Airflow workload %s has failed a maximum of %s times. Marking as failed. "
-                "stop_code=%s failure_kind=%s",
+                "Airflow workload %s has failed a maximum of %s times. Marking as failed",
                 task_key,
                 failure_count,
-                stop_code,
-                failure_kind,
             )
-            if is_task_instance:
-                self.fail(task_key, failure_kind=failure_kind, reason=failure_reason)
+            if _SUPPORTS_FAILURE_CAUSE and isinstance(task_key, (TaskInstanceUuid, TaskInstanceKey)):
+                self.fail(
+                    key=task_key,
+                    failure_kind=TaskFailureKind.INFRA if stop_code == _SPOT_INTERRUPTION_STOP_CODE else None,
+                    reason=stop_code,
+                )
             else:
                 self.fail(task_key)
         self.active_workers.pop_by_key(task_key)
