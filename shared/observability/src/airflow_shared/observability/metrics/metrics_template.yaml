@@ -168,6 +168,21 @@ metrics:
     legacy_name: "-"
     name_variables: []
 
+  - name: "ti_infra_retry_granted"
+    description: "Infrastructure retries granted by ``[core] max_infra_retries`` after a confirmed
+    infrastructure failure of a running attempt. Metric with dag_id and task_id tagging."
+    type: "counter"
+    legacy_name: "-"
+    name_variables: []
+
+  - name: "ti_infra_retry_denied"
+    description: "Confirmed infrastructure failures of running attempts refused an infrastructure retry
+    because the task instance reached ``[core] max_infra_retries``. Ordinary retry handling still applies.
+    Metric with dag_id and task_id tagging."
+    type: "counter"
+    legacy_name: "-"
+    name_variables: []
+
   - name: "ti_successes"
     description: "Overall task instances successes. Metric with dag_id and task_id tagging."
     type: "counter"

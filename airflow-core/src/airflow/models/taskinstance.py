@@ -91,6 +91,7 @@ from airflow._shared.observability.traces import (
     new_dagrun_trace_carrier,
     new_task_run_carrier,
 )
+from airflow._shared.state import TaskFailureKind
 from airflow._shared.timezones import timezone
 from airflow.assets.manager import asset_manager
 from airflow.configuration import conf
@@ -179,7 +180,6 @@ if TYPE_CHECKING:
     from sqlalchemy.sql import Update
     from sqlalchemy.sql.elements import ColumnElement
 
-    from airflow._shared.state import TaskFailureKind
     from airflow.api_fastapi.execution_api.datamodels.asset import AssetProfile
     from airflow.models.dag import DagModel
     from airflow.models.dagrun import DagRun
@@ -2870,8 +2870,26 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
         # Actual callbacks are handled by the DAG processor, not the scheduler
         task = getattr(ti, "task", None)
 
+        infra_retry: bool | None = ti.get_infra_retry_decision(failure_kind=failure_kind)
+        if infra_retry:
+            ti.max_tries += 1
+            stats.incr("ti_infra_retry_granted", tags=ti.stats_tags)
+            cls.logger().info(
+                "Granting an infrastructure retry to %s; max_tries is now %s (reason: %s)",
+                ti,
+                ti.max_tries,
+                reason,
+            )
+        elif infra_retry is False:
+            stats.incr("ti_infra_retry_denied", tags=ti.stats_tags)
+            cls.logger().info(
+                "Refusing an infrastructure retry to %s: [core] max_infra_retries is reached (reason: %s)",
+                ti,
+                reason,
+            )
+
         allocate_next_try = False
-        if not ti.is_eligible_to_retry():
+        if not infra_retry and not ti.is_eligible_to_retry():
             ti.state = TaskInstanceState.FAILED
 
             if fail_fast and task and task.dag:
@@ -2971,6 +2989,24 @@ class TaskInstance(Base, LoggingMixin, BaseWorkload):
             assert self.task.retries
 
         return bool(self.task.retries and self.try_number <= self.max_tries)
+
+    def get_infra_retry_decision(self, failure_kind: TaskFailureKind | None) -> bool | None:
+        """
+        Decide whether ``[core] max_infra_retries`` allows another attempt after this failure.
+
+        Failure causes are not persisted, so the allowance already used is inferred from
+        ``max_tries`` and ``try_number``. Return ``None`` when the policy does not apply: it is
+        disabled, the cause is not a confirmed infrastructure failure, or the attempt is not running.
+        """
+        if failure_kind != TaskFailureKind.INFRA or self.task is None:
+            return None
+        if self.state != TaskInstanceState.RUNNING or self.try_number < 1:
+            return None
+        max_infra_retries: int = conf.getint("core", "max_infra_retries")
+        if max_infra_retries <= 0:
+            return None
+        used: int = max((self.max_tries or 0) - (self.task.retries or 0), self.try_number - 1, 0)
+        return used < max_infra_retries
 
     def set_duration(self) -> None:
         """Set task instance duration."""

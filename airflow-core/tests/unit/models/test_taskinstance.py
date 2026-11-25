@@ -147,6 +147,9 @@ from unit.models import DEFAULT_DATE
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from uuid import UUID
+
+    from pytest_mock import MockerFixture
 
     from tests_common.pytest_plugin import DagMaker
 
@@ -5919,6 +5922,216 @@ def test_failure_listener_receives_failed_try_before_rotation(
         assert ti.id == original_id
         assert ti.try_number == 1
         assert ti.external_executor_id == "previous-worker"
+
+
+@pytest.mark.parametrize(
+    (
+        "max_infra_retries",
+        "failure_kind",
+        "state",
+        "try_number",
+        "retries",
+        "max_tries",
+        "task_loaded",
+        "expected",
+    ),
+    [
+        pytest.param(0, TaskFailureKind.INFRA, State.RUNNING, 1, 0, 0, True, None, id="disabled"),
+        pytest.param(-1, TaskFailureKind.INFRA, State.RUNNING, 1, 0, 0, True, None, id="negative_limit"),
+        *(
+            pytest.param(1, kind, State.RUNNING, 1, 0, 0, True, None, id=f"{kind}_cause")
+            for kind in (None, TaskFailureKind.APPLICATION, TaskFailureKind.TIMEOUT, TaskFailureKind.MANUAL)
+        ),
+        *(
+            pytest.param(1, TaskFailureKind.INFRA, state, 1, 0, 0, True, None, id=f"{state}_attempt")
+            for state in (
+                State.SCHEDULED,
+                State.QUEUED,
+                State.RESTARTING,
+                State.UP_FOR_RETRY,
+                State.SUCCESS,
+                State.FAILED,
+            )
+        ),
+        pytest.param(1, TaskFailureKind.INFRA, State.RUNNING, 0, 0, 0, True, None, id="no_attempt_number"),
+        pytest.param(1, TaskFailureKind.INFRA, State.RUNNING, 1, 0, 0, False, None, id="task_not_loaded"),
+        pytest.param(3, TaskFailureKind.INFRA, State.RUNNING, 1, 0, 0, True, True, id="first_of_three"),
+        pytest.param(3, TaskFailureKind.INFRA, State.RUNNING, 2, 0, 1, True, True, id="second_of_three"),
+        pytest.param(3, TaskFailureKind.INFRA, State.RUNNING, 3, 0, 2, True, True, id="third_of_three"),
+        pytest.param(3, TaskFailureKind.INFRA, State.RUNNING, 4, 0, 3, True, False, id="fourth_of_three"),
+        pytest.param(
+            1, TaskFailureKind.INFRA, State.RUNNING, 1, 1, 1, True, True, id="ordinary_retry_unused"
+        ),
+        pytest.param(1, TaskFailureKind.INFRA, State.RUNNING, 2, 1, 1, True, False, id="ordinary_retry_used"),
+        pytest.param(3, TaskFailureKind.INFRA, State.RUNNING, 2, 0, 3, True, False, id="allowance_recorded"),
+        pytest.param(3, TaskFailureKind.INFRA, State.RUNNING, 2, 3, 3, True, True, id="retries_raised"),
+        pytest.param(
+            3, TaskFailureKind.INFRA, State.RUNNING, 4, 3, 3, True, False, id="earlier_attempts_at_limit"
+        ),
+    ],
+)
+def test_get_infra_retry_decision(
+    max_infra_retries: int,
+    failure_kind: TaskFailureKind | None,
+    state: TaskInstanceState,
+    try_number: int,
+    retries: int,
+    max_tries: int,
+    task_loaded: bool,
+    expected: bool | None,
+    dag_maker: DagMaker,
+    session: Session,
+) -> None:
+    with dag_maker(session=session) as dag:
+        EmptyOperator(task_id="task", retries=retries)
+    ti = dag_maker.create_dagrun().get_task_instance("task", session=session)
+    assert ti is not None
+    ti.task = dag.get_task("task") if task_loaded else None
+    ti.state = state
+    ti.try_number = try_number
+    ti.max_tries = max_tries
+
+    with conf_vars({("core", "max_infra_retries"): str(max_infra_retries)}):
+        assert ti.get_infra_retry_decision(failure_kind=failure_kind) is expected
+
+
+@pytest.mark.parametrize(
+    (
+        "max_infra_retries",
+        "failure_kind",
+        "retries",
+        "try_number",
+        "max_tries",
+        "expected_state",
+        "expected_max_tries",
+        "expected_metric",
+    ),
+    [
+        pytest.param(
+            1, TaskFailureKind.INFRA, 0, 1, 0, State.UP_FOR_RETRY, 1, "ti_infra_retry_granted", id="granted"
+        ),
+        pytest.param(
+            1,
+            TaskFailureKind.INFRA,
+            1,
+            1,
+            1,
+            State.UP_FOR_RETRY,
+            2,
+            "ti_infra_retry_granted",
+            id="granted_keeps_ordinary_retry",
+        ),
+        pytest.param(
+            1, TaskFailureKind.INFRA, 0, 2, 1, State.FAILED, 1, "ti_infra_retry_denied", id="denied"
+        ),
+        pytest.param(
+            1,
+            TaskFailureKind.INFRA,
+            2,
+            2,
+            2,
+            State.UP_FOR_RETRY,
+            2,
+            "ti_infra_retry_denied",
+            id="denied_ordinary_retry_left",
+        ),
+        pytest.param(0, TaskFailureKind.INFRA, 0, 1, 0, State.FAILED, 0, None, id="disabled"),
+        pytest.param(1, TaskFailureKind.APPLICATION, 0, 1, 0, State.FAILED, 0, None, id="application"),
+        pytest.param(1, None, 0, 1, 0, State.FAILED, 0, None, id="unknown_cause"),
+    ],
+)
+@patch("airflow._shared.observability.metrics.stats._get_backend")
+def test_handle_failure_applies_infra_retry_decision(
+    mock_get_backend: mock.MagicMock,
+    max_infra_retries: int,
+    failure_kind: TaskFailureKind | None,
+    retries: int,
+    try_number: int,
+    max_tries: int,
+    expected_state: TaskInstanceState,
+    expected_max_tries: int,
+    expected_metric: str | None,
+    dag_maker: DagMaker,
+    session: Session,
+    mocker: MockerFixture,
+) -> None:
+    backend = mock.MagicMock(spec=StatsLogger)
+    mock_get_backend.return_value = backend
+    with dag_maker(session=session) as dag:
+        EmptyOperator(task_id="task", retries=retries)
+    ti = dag_maker.create_dagrun().get_task_instance("task", session=session)
+    assert ti is not None
+    ti.task = dag.get_task("task")
+    ti.state = State.RUNNING
+    ti.try_number = try_number
+    ti.max_tries = max_tries
+    session.flush()
+    failed_id = ti.id
+    received: list[tuple[UUID, int, str | None, int, TaskFailureKind | None, str | None]] = []
+
+    def record_failure(
+        previous_state: TaskInstanceState | None,
+        task_instance: TaskInstance,
+        error: str | BaseException | None,
+        failure_kind: TaskFailureKind | None = None,
+        reason: str | None = None,
+    ) -> None:
+        received.append(
+            (
+                task_instance.id,
+                task_instance.try_number,
+                task_instance.state,
+                task_instance.max_tries,
+                failure_kind,
+                reason,
+            )
+        )
+
+    mocker.patch.object(
+        get_listener_manager().hook, "on_task_instance_failed", autospec=True, side_effect=record_failure
+    )
+
+    with conf_vars({("core", "max_infra_retries"): str(max_infra_retries)}):
+        next_ti = ti.handle_failure(
+            error="worker lost", session=session, failure_kind=failure_kind, reason="PreemptionByScheduler"
+        )
+
+    assert received == [
+        (failed_id, try_number, expected_state, expected_max_tries, failure_kind, "PreemptionByScheduler")
+    ]
+    expected_try_number = try_number + 1 if expected_state == State.UP_FOR_RETRY else try_number
+    assert (next_ti.state, next_ti.try_number, next_ti.max_tries) == (
+        expected_state,
+        expected_try_number,
+        expected_max_tries,
+    )
+    infra_retry_metrics = [
+        call for call in backend.incr.call_args_list if call.args[0].startswith("ti_infra_retry_")
+    ]
+    assert infra_retry_metrics == (
+        [mock.call(expected_metric, tags=ti.stats_tags)] if expected_metric else []
+    )
+
+
+@conf_vars({("core", "max_infra_retries"): "1"})
+def test_clear_does_not_restore_infra_retries(dag_maker: DagMaker, session: Session) -> None:
+    with dag_maker(session=session) as dag:
+        EmptyOperator(task_id="task", retries=0)
+    ti = dag_maker.create_dagrun().get_task_instance("task", session=session)
+    assert ti is not None
+    ti.try_number = 1
+    outcomes: list[tuple[int, str | None, int]] = []
+
+    for clear in (False, False, True):
+        if clear:
+            (ti,) = clear_task_instances(tis=[ti], session=session)
+        ti.task = dag.get_task("task")
+        ti.state = State.RUNNING
+        session.flush()
+        ti = ti.handle_failure(error="preempted", session=session, failure_kind=TaskFailureKind.INFRA)
+        outcomes.append((ti.try_number, ti.state, ti.max_tries))
+
+    assert outcomes == [(2, State.UP_FOR_RETRY, 1), (2, State.FAILED, 1), (3, State.FAILED, 2)]
 
 
 def test_archive_decides_from_the_state_committed_after_the_lock(completed_loop, session):

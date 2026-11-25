@@ -211,9 +211,50 @@ Tagged metrics backends add a bounded ``failure_kind`` label to ``ti_failures`` 
 ``operator_failures``. An unset cause becomes ``unclassified`` in metrics only; listener
 arguments retain ``None``. Classic StatsD retains aggregate counts but drops these tags.
 
-Classification does not grant attempts, change retry or clear behavior, or add fields to the
+Classification alone does not grant attempts, change retry or clear behavior, or add fields to the
 Dag callback context. See :doc:`/administration-and-deployment/listeners` for consuming
 the cause through infrastructure listener hooks.
+
+.. _concepts:infrastructure-retries:
+
+Infrastructure retries
+----------------------
+
+An infrastructure interruption can use up a retry meant for an application failure. For example, a
+Spark task with ``retries=1`` whose first attempt is preempted has no retry left when its second
+attempt fails in Spark. Administrators can set :ref:`config:core__max_infra_retries` to give each task
+instance extra attempts for confirmed infrastructure failures instead of raising ``retries`` for every
+kind of failure. The default, ``0``, disables infrastructure retries. There is no Dag or task setting,
+and tasks with ``retries=0`` also receive them.
+
+Only a failure that the executor reports as ``infra`` (see `Failure causes`_) for a ``RUNNING`` attempt
+qualifies. Application failures, timeouts, manual failures, unknown causes, worker loss without a
+confirmed cause, missed heartbeats and failures before the task starts do not. When the scheduler grants
+an infrastructure retry, it adds one to the task instance's ``max_tries`` and sets it to ``up_for_retry``.
+The next attempt follows the usual retry delay and backoff, ``on_retry_callback`` and retry emails fire,
+and failure listeners receive the attempt that failed. When the scheduler refuses, ordinary retry
+handling decides as before.
+
+Failure causes are not stored, so the scheduler infers how much of the limit a task instance has used
+from fields kept for every attempt:
+
+.. code-block:: python
+
+    max((max_tries or 0) - (retries or 0), try_number - 1, 0)
+
+It grants an infrastructure retry only while this value is below ``max_infra_retries``. The first term
+counts retry allowance already added beyond ``retries`` and the second counts all earlier attempts, so
+ordinary attempts, clears and edits to ``retries`` count against the limit, and neither a scheduler
+restart nor a clear resets it. Raising ``retries`` can make a later attempt eligible again after a
+refusal, but once ``try_number - 1`` reaches the limit, neither clears nor ``retries`` edits restore it.
+
+With ``retries=1`` and ``max_infra_retries = 1``, a preemption of attempt 1 raises ``max_tries`` from 1
+to 2. Attempt 2 replaces the interrupted attempt, and if attempt 2 fails in the application, the
+ordinary retry still runs as attempt 3.
+
+The ``ti_infra_retry_granted`` and ``ti_infra_retry_denied`` counters record the decisions under separate
+names, so classic StatsD, which drops tags, can tell them apart. Neither increments when the limit is
+``0`` or the failure is not a confirmed infrastructure failure of a running attempt.
 
 .. _concepts:retry-policies:
 

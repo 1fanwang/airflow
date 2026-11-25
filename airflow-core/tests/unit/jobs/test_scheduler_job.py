@@ -204,6 +204,7 @@ from unit.listeners import dag_listener
 from unit.models import TEST_DAGS_FOLDER
 
 if TYPE_CHECKING:
+    from pytest_mock import MockerFixture
     from sqlalchemy.orm.session import Session
 
     from tests_common.pytest_plugin import DagMaker
@@ -11507,6 +11508,242 @@ class TestSchedulerJob:
         assert request.context_from_server.max_tries == retries
         assert "failure_kind" not in type(request.context_from_server).model_fields
         assert "failure_reason" not in type(request.context_from_server).model_fields
+
+    @pytest.mark.parametrize(
+        ("max_infra_retries", "retries", "failure_kind", "expected_state", "expected_max_tries"),
+        [
+            pytest.param(1, 0, TaskFailureKind.INFRA, TaskInstanceState.UP_FOR_RETRY, 1, id="infra_granted"),
+            pytest.param(
+                1, 1, TaskFailureKind.INFRA, TaskInstanceState.UP_FOR_RETRY, 2, id="infra_granted_keeps_retry"
+            ),
+            pytest.param(0, 0, TaskFailureKind.INFRA, TaskInstanceState.FAILED, 0, id="disabled"),
+            pytest.param(1, 0, TaskFailureKind.APPLICATION, TaskInstanceState.FAILED, 0, id="application"),
+            pytest.param(1, 0, None, TaskInstanceState.FAILED, 0, id="unknown_cause"),
+        ],
+    )
+    def test_executor_failure_notifications_follow_infra_retry(
+        self,
+        max_infra_retries: int,
+        retries: int,
+        failure_kind: TaskFailureKind | None,
+        expected_state: TaskInstanceState,
+        expected_max_tries: int,
+        dag_maker: DagMaker,
+        session: Session,
+        mocker: MockerFixture,
+    ) -> None:
+        with dag_maker(dag_id="infra_retry_notifications", fileloc="/test_path1/"):
+            EmptyOperator(
+                task_id="task",
+                retries=retries,
+                on_retry_callback=lambda context: None,
+                on_failure_callback=lambda context: None,
+                email="test@example.com",
+                email_on_retry=True,
+                email_on_failure=True,
+            )
+        dag_run = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+        ti = dag_run.get_task_instance(task_id="task", session=session)
+        assert ti is not None
+        ti.state = TaskInstanceState.RUNNING
+        ti.try_number = 1
+        session.commit()
+        failed_id = ti.id
+        received: list[tuple[UUID, int, str | None, int]] = []
+
+        def record_failure(
+            previous_state: TaskInstanceState | None,
+            task_instance: TaskInstance,
+            error: str | BaseException | None,
+            failure_kind: TaskFailureKind | None = None,
+            reason: str | None = None,
+        ) -> None:
+            received.append(
+                (task_instance.id, task_instance.try_number, task_instance.state, task_instance.max_tries)
+            )
+
+        mocker.patch.object(
+            get_listener_manager().hook, "on_task_instance_failed", autospec=True, side_effect=record_failure
+        )
+        executor = MockExecutor(do_update=False)
+        self.job_runner = SchedulerJobRunner(Job(), executors=[executor])
+        executor._register_task(ti)
+        executor.fail(key=ti.key, failure_kind=failure_kind, reason="PreemptionByScheduler")
+
+        with conf_vars({("core", "max_infra_retries"): str(max_infra_retries)}):
+            self.job_runner._process_executor_events(executor=executor, session=session)
+
+        assert executor.callback_sink is not None
+        send_callback = executor.callback_sink.send
+        assert isinstance(send_callback, mock.Mock)
+        callback, email = (call.args[0] for call in send_callback.call_args_list)
+        assert isinstance(callback, TaskCallbackRequest)
+        assert isinstance(email, EmailRequest)
+        retrying = expected_state == TaskInstanceState.UP_FOR_RETRY
+        assert (callback.task_callback_type, email.email_type) == (
+            expected_state,
+            "retry" if retrying else "failure",
+        )
+        for request in (callback, email):
+            assert request.context_from_server is not None
+            assert (request.ti.id, request.ti.try_number, request.context_from_server.max_tries) == (
+                failed_id,
+                1,
+                expected_max_tries,
+            )
+        assert received == [(failed_id, 1, expected_state, expected_max_tries)]
+        current = dag_run.get_task_instance(task_id="task", session=session)
+        assert current is not None
+        assert (current.id != failed_id, current.state, current.max_tries) == (
+            retrying,
+            expected_state,
+            expected_max_tries,
+        )
+
+    @mock.patch("airflow._shared.observability.metrics.stats._get_backend")
+    @conf_vars({("core", "max_infra_retries"): "3"})
+    def test_repeated_infra_failure_event_grants_one_retry(
+        self, mock_get_backend: mock.MagicMock, dag_maker: DagMaker, session: Session
+    ) -> None:
+        backend = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = backend
+        with dag_maker(dag_id="infra_retry_repeated_event"):
+            EmptyOperator(task_id="task", retries=0)
+        dag_run = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+        ti = dag_run.get_task_instance(task_id="task", session=session)
+        assert ti is not None
+        ti.state = TaskInstanceState.RUNNING
+        ti.try_number = 1
+        session.commit()
+        failed_key = TaskInstanceUuid(ti.id)
+        executor = MockExecutor(do_update=False)
+        self.job_runner = SchedulerJobRunner(Job(), executors=[executor])
+
+        for _ in range(2):
+            executor.fail(key=failed_key, failure_kind=TaskFailureKind.INFRA, reason="PreemptionByScheduler")
+            self.job_runner._process_executor_events(executor=executor, session=session)
+
+        current = dag_run.get_task_instance(task_id="task", session=session)
+        assert current is not None
+        assert (current.try_number, current.state, current.max_tries) == (
+            2,
+            TaskInstanceState.UP_FOR_RETRY,
+            1,
+        )
+        assert [
+            call.args[0] for call in backend.incr.call_args_list if call.args[0].startswith("ti_infra_retry_")
+        ] == ["ti_infra_retry_granted"]
+
+    @conf_vars({("core", "max_infra_retries"): "1"})
+    def test_executor_failure_rereads_a_row_released_by_an_earlier_commit(
+        self, dag_maker: DagMaker, session: Session
+    ) -> None:
+        with dag_maker(dag_id="infra_retry_stale_batch"):
+            EmptyOperator(task_id="first", retries=0)
+            EmptyOperator(task_id="second", retries=0)
+        dag_run = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+        tis = dag_run.get_task_instances(session=session)
+        for ti in tis:
+            ti.state = TaskInstanceState.RUNNING
+            ti.try_number = 1
+        session.commit()
+        executor = MockExecutor(do_update=False)
+        self.job_runner = SchedulerJobRunner(Job(), executors=[executor])
+        for ti in tis:
+            executor._register_task(ti)
+            executor.fail(key=ti.key, failure_kind=TaskFailureKind.INFRA, reason="PreemptionByScheduler")
+        marked_successful: list[str] = []
+
+        def mark_unhandled_task_successful(committed_session: Session) -> None:
+            if marked_successful:
+                return
+            with create_session(scoped=False) as other_session:
+                unhandled = other_session.scalars(
+                    select(TaskInstance).where(
+                        TaskInstance.dag_id == dag_run.dag_id,
+                        TaskInstance.state == TaskInstanceState.RUNNING,
+                    )
+                ).one()
+                unhandled.state = TaskInstanceState.SUCCESS
+                marked_successful.append(unhandled.task_id)
+
+        sa_event.listen(session, "after_commit", mark_unhandled_task_successful)
+        try:
+            self.job_runner._process_executor_events(executor=executor, session=session)
+        finally:
+            sa_event.remove(session, "after_commit", mark_unhandled_task_successful)
+
+        assert len(marked_successful) == 1
+        current = dag_run.get_task_instance(task_id=marked_successful[0], session=session)
+        assert current is not None
+        assert (current.state, current.max_tries) == (TaskInstanceState.SUCCESS, 0)
+
+    @conf_vars({("core", "max_infra_retries"): "1"})
+    def test_executor_events_for_finished_task_instances_reread_no_rows(
+        self, dag_maker: DagMaker, session: Session
+    ) -> None:
+        def count_event_queries(dag_id: str, num_tasks: int) -> int:
+            with dag_maker(dag_id=dag_id, session=session):
+                for index in range(num_tasks):
+                    EmptyOperator(task_id=f"t{index}")
+            dag_run = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+            executor = MockExecutor(do_update=False)
+            self.job_runner = SchedulerJobRunner(Job(), executors=[executor])
+            for ti in dag_run.get_task_instances(session=session):
+                ti.state = TaskInstanceState.SUCCESS
+                executor.change_state(key=TaskInstanceUuid(ti.id), state=TaskInstanceState.SUCCESS)
+            session.commit()
+            with count_queries(session=session) as result:
+                self.job_runner._process_executor_events(executor=executor, session=session)
+            return sum(result.values())
+
+        assert count_event_queries(dag_id="finished_one", num_tasks=1) == count_event_queries(
+            dag_id="finished_many", num_tasks=10
+        )
+
+    @pytest.mark.parametrize("failure_kind", [None, TaskFailureKind.INFRA], ids=["unclassified", "infra"])
+    @mock.patch("airflow._shared.observability.metrics.stats._get_backend")
+    def test_executor_failure_with_infra_retries_disabled_adds_no_query(
+        self,
+        mock_get_backend: mock.MagicMock,
+        dag_maker: DagMaker,
+        session: Session,
+        failure_kind: TaskFailureKind | None,
+    ) -> None:
+        backend = mock.MagicMock(spec=StatsLogger)
+        mock_get_backend.return_value = backend
+
+        def fail_running_task(
+            dag_id: str, max_infra_retries: str, kind: TaskFailureKind | None
+        ) -> tuple[int, tuple[str | None, int]]:
+            with conf_vars({("core", "max_infra_retries"): max_infra_retries}):
+                with dag_maker(dag_id=dag_id, session=session):
+                    EmptyOperator(task_id="task", retries=0)
+                dag_run = dag_maker.create_dagrun(state=DagRunState.RUNNING)
+                ti = dag_run.get_task_instance(task_id="task", session=session)
+                assert ti is not None
+                ti.state = TaskInstanceState.RUNNING
+                ti.try_number = 1
+                session.commit()
+                executor = MockExecutor(do_update=False)
+                self.job_runner = SchedulerJobRunner(Job(), executors=[executor])
+                executor.fail(key=TaskInstanceUuid(ti.id), failure_kind=kind)
+                with count_queries(session=session) as result:
+                    self.job_runner._process_executor_events(executor=executor, session=session)
+                current = dag_run.get_task_instance(task_id="task", session=session)
+                assert current is not None
+                return sum(result.values()), (current.state, current.max_tries)
+
+        disabled_queries, disabled_outcome = fail_running_task(
+            dag_id="infra_retry_disabled", max_infra_retries="0", kind=failure_kind
+        )
+        enabled_queries, _ = fail_running_task(dag_id="infra_retry_enabled", max_infra_retries="1", kind=None)
+
+        assert disabled_outcome == (TaskInstanceState.FAILED, 0)
+        assert enabled_queries == disabled_queries + 1
+        assert not [
+            call.args[0] for call in backend.incr.call_args_list if call.args[0].startswith("ti_infra_retry_")
+        ]
 
     @pytest.mark.parametrize(
         ("dag_run_bv", "dag_version_bv", "expected_bv"),
