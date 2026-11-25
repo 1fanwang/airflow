@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future, wait
 from functools import partial
+from typing import TYPE_CHECKING, Any
 from unittest import mock
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
@@ -76,6 +77,14 @@ if hasattr(BaseExecutor, "get_task_key"):
 
     if not AIRFLOW_V_3_4_PLUS:
         from airflow.models.taskinstancehistory import TaskInstanceHistory
+
+if hasattr(BaseExecutor, "get_task_failure_info"):
+    from airflow.executors.base_executor import TaskFailureKind
+    from airflow.models.callback import CallbackKey
+    from airflow.utils.state import CallbackState
+
+if TYPE_CHECKING:
+    from airflow.executors.workloads import ExecuteTask
 
 airflow_version = VersionInfo(*map(int, airflow_version_str.split(".")[:3]))
 
@@ -2543,3 +2552,115 @@ class TestTaskIdentity:
         mock_executor.ecs.describe_tasks.assert_not_called()
         assert not mock_executor.running
         assert not mock_executor.get_event_buffer()
+
+
+class TestFailureCause:
+    @staticmethod
+    def _stopped_task(stop_code: str | None, started: bool) -> dict[str, Any]:
+        task: dict[str, Any] = {
+            "taskArn": ARN1,
+            "lastStatus": "STOPPED",
+            "desiredStatus": "STOPPED",
+            "stoppedReason": "Your Spot Task was interrupted.",
+            "containers": [{"name": "container-name", "lastStatus": "STOPPED"}],
+        }
+        if started:
+            task["startedAt"] = 1
+            task["containers"][0]["exitCode"] = 137
+        if stop_code is not None:
+            task["stopCode"] = stop_code
+        return task
+
+    @staticmethod
+    def _fail_on_ecs(executor: AwsEcsExecutor, workload: ExecuteTask, ecs_task: dict[str, Any]) -> None:
+        executor.queue_workload(workload, session=None)
+        executor._process_workloads([workload])
+        executor.ecs.run_task.return_value = {
+            "tasks": [
+                {"taskArn": ARN1, "lastStatus": "PENDING", "desiredStatus": "RUNNING", "containers": []}
+            ],
+            "failures": [],
+        }
+        executor.attempt_workload_runs()
+        executor.max_run_task_attempts = "1"
+        executor.ecs.describe_tasks.return_value = {"tasks": [ecs_task], "failures": []}
+        executor.sync_running_workloads()
+
+    @pytest.mark.skipif(
+        not hasattr(BaseExecutor, "get_task_failure_info"), reason="Requires the task failure cause contract"
+    )
+    @pytest.mark.parametrize("native_key", [True, False])
+    @pytest.mark.parametrize(
+        ("stop_code", "started", "failure_kind"),
+        [
+            pytest.param("SpotInterruption", True, "infra", id="spot-running"),
+            pytest.param("SpotInterruption", False, "infra", id="spot-before-start"),
+            pytest.param("EssentialContainerExited", True, None, id="container-exited"),
+            pytest.param("TaskFailedToStart", False, None, id="failed-to-start"),
+        ],
+    )
+    def test_failure_reports_stop_code(
+        self,
+        mock_executor: AwsEcsExecutor,
+        task_identity_workloads: list[ExecuteTask],
+        monkeypatch: pytest.MonkeyPatch,
+        native_key: bool,
+        stop_code: str,
+        started: bool,
+        failure_kind: str | None,
+    ) -> None:
+        if not native_key:
+            monkeypatch.setattr(AwsEcsExecutor, "supports_task_instance_uuid", False)
+        workload = task_identity_workloads[0]
+        key = TaskInstanceUuid(workload.ti.id) if native_key else workload.ti.key
+
+        self._fail_on_ecs(
+            executor=mock_executor,
+            workload=workload,
+            ecs_task=self._stopped_task(stop_code=stop_code, started=started),
+        )
+
+        assert mock_executor.get_event_buffer()[key][0] == TaskInstanceState.FAILED
+        info = mock_executor.get_task_failure_info(key)
+        assert info is not None
+        assert info[0] is (TaskFailureKind(failure_kind) if failure_kind else None)
+        assert info[1] == stop_code
+
+    @pytest.mark.skipif(
+        not hasattr(BaseExecutor, "get_task_failure_info"), reason="Requires the task failure cause contract"
+    )
+    def test_callback_failure_reports_no_cause(self, mock_executor: AwsEcsExecutor) -> None:
+        key = CallbackKey("12345678-1234-5678-1234-567812345678")
+        mock_executor.max_run_task_attempts = "1"
+        mock_executor.active_workers.add_task(mock_task(ARN1), key, None, _generate_mock_cmd(), {}, 1)
+        mock_executor.ecs.describe_tasks.return_value = {
+            "tasks": [self._stopped_task(stop_code="SpotInterruption", started=True)],
+            "failures": [],
+        }
+
+        mock_executor.sync_running_workloads()
+
+        assert mock_executor.get_event_buffer()[key][0] == CallbackState.FAILED
+        assert mock_executor.get_task_failure_info(key) is None
+
+    def test_core_without_cause_contract_gets_plain_fail(
+        self, mock_executor: AwsEcsExecutor, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        failed: list[tuple[TaskInstanceKey, Any]] = []
+
+        def fail_before_cause_contract(self: AwsEcsExecutor, key: TaskInstanceKey, info: Any = None) -> None:
+            failed.append((key, info))
+
+        monkeypatch.setattr(ecs_executor, "_SUPPORTS_FAILURE_CAUSE", False)
+        monkeypatch.setattr(AwsEcsExecutor, "fail", fail_before_cause_contract)
+        key = TaskInstanceKey("dag", "task", "run", 1)
+        mock_executor.max_run_task_attempts = "1"
+        mock_executor.active_workers.add_task(mock_task(ARN1), key, "default", _generate_mock_cmd(), {}, 1)
+        mock_executor.ecs.describe_tasks.return_value = {
+            "tasks": [self._stopped_task(stop_code="SpotInterruption", started=True)],
+            "failures": [],
+        }
+
+        mock_executor.sync_running_workloads()
+
+        assert failed == [(key, None)]

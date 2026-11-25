@@ -123,6 +123,16 @@ provider package.
 .. note::
    ``exec_config`` is an optional parameter that can be provided to operators. It is a dictionary type and in the context of the ECS Executor it represents a ``run_task_kwargs`` configuration which is then updated over-top of the ``run_task_kwargs`` specified in Airflow config above (if present). It is a recursive update which essentially applies Python update to each nested dictionary in the configuration. Loosely approximated as: ``run_task_kwargs.update(exec_config)``
 
+Failure causes
+--------------
+
+When a task fails on its last ECS attempt, the ECS Executor reports the ``stopCode`` of that ECS
+task as the failure reason, on Airflow versions that accept failure causes from executors. ECS sets
+``SpotInterruption`` when Spot capacity is unavailable or reclaimed, so that code is also reported as
+an ``infra`` failure. Other stop codes leave the failure kind unset. Failure listeners receive both
+values; the ``ti_failures`` and ``operator_failures`` metrics carry only the kind. Reporting a cause
+does not change retries.
+
 .. _dockerfile_for_ecs_executor:
 
 .. include:: general.rst
