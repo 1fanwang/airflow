@@ -595,7 +595,12 @@ class BulkStateFetcher(LoggingMixin):
             task_result = task_results_by_task_id.get(task_id)
             if task_result:
                 state = task_result["status"]
-                info = task_result.get("info")
+                # Reading "info" would drop the failure's exception because Celery's meta keeps it in "result":
+                # https://github.com/celery/celery/blob/3f4d8d795ad128bd7430cc5dc174a802cded425c/celery/backends/base.py#L568-L574
+                # https://github.com/celery/celery/blob/3f4d8d795ad128bd7430cc5dc174a802cded425c/celery/backends/database/models.py#L45-L52
+                info = (
+                    task_result.get("result") if state == celery_states.FAILURE else task_result.get("info")
+                )
             else:
                 state = celery_states.PENDING
                 info = None

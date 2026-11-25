@@ -21,25 +21,30 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import sys
 from ast import literal_eval
 from datetime import datetime, timedelta
+from pathlib import PurePosixPath
 from time import sleep
+from typing import TYPE_CHECKING
 from unittest import mock
 
 # Leave this it is used by the test worker.
 import celery.contrib.testing.tasks  # noqa: F401
 import pytest
 import uuid6
-from celery import Celery
+from celery import Celery, states as celery_states
 from celery.backends.base import BaseBackend, BaseKeyValueStoreBackend
 from celery.backends.database import DatabaseBackend
 from celery.contrib.testing.worker import start_worker
+from celery.exceptions import WorkerLostError
 from kombu.asynchronous import set_event_loop
 from kubernetes.client import models as k8s
 
 from airflow._shared.timezones import timezone
 from airflow.executors import workloads
+from airflow.executors.base_executor import BaseExecutor
 from airflow.executors.workloads.base import BundleInfo
 from airflow.executors.workloads.task import TaskInstanceDTO
 from airflow.models.dag import DAG
@@ -47,11 +52,14 @@ from airflow.models.taskinstance import TaskInstance
 from airflow.providers.common.compat.sdk import AirflowException, AirflowTaskTimeout, conf
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.sdk import BaseOperator
-from airflow.utils.state import State
+from airflow.utils.state import State, TaskInstanceState
 
 from tests_common.test_utils import db
 from tests_common.test_utils.taskinstance import create_task_instance
 from tests_common.test_utils.version_compat import AIRFLOW_V_3_0_PLUS
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +267,61 @@ class TestCeleryExecutor:
         assert key_fail not in executor.workloads
 
         assert executor.queued_tasks == {}
+
+    @pytest.mark.skipif(
+        not hasattr(BaseExecutor, "get_task_failure_info"), reason="Requires executor failure reasons"
+    )
+    @pytest.mark.parametrize("broker_url", _prepare_test_bodies())
+    def test_worker_lost_reports_reason_without_failure_kind(self, broker_url: str, session: Session) -> None:
+        from airflow.providers.celery.executors import celery_executor
+
+        def fake_execute(input: str) -> None:
+            sleep(60)
+
+        ti = TaskInstanceDTO(
+            id=uuid6.uuid7(),
+            dag_version_id=uuid6.uuid7(),
+            dag_id="dag",
+            task_id="lost",
+            run_id="run",
+            try_number=1,
+            map_index=-1,
+            pool_slots=1,
+            priority_weight=1,
+            queue="default",
+            external_executor_id=str(uuid6.uuid7()),
+        )
+        workload = workloads.ExecuteTask(
+            ti=ti,
+            dag_rel_path=PurePosixPath("test.py"),
+            token="",
+            bundle_info=BundleInfo(name="test"),
+            log_path="test.log",
+        )
+        with _prepare_app(broker_url, execute=fake_execute) as app:
+            executor = celery_executor.CeleryExecutor()
+            executor._sync_parallelism = 1
+            key = executor.get_task_key(ti)
+            with start_worker(app=app, logfile=sys.stdout, loglevel="info", pool="prefork", concurrency=1):
+                executor.queue_workload(workload, session=session)
+                executor.trigger_workloads(open_slots=1)
+                result = executor.workloads[key]
+                for _ in range(150):
+                    if result.state == celery_states.STARTED:
+                        break
+                    sleep(0.2)
+                child_pid = result.info["pid"]
+                assert child_pid != os.getpid()
+                os.kill(child_pid, signal.SIGKILL)
+                for _ in range(150):
+                    executor.sync()
+                    if key not in executor.workloads:
+                        break
+                    sleep(0.2)
+
+        state, info = executor.event_buffer[key]
+        assert (state, type(info)) == (TaskInstanceState.FAILED, WorkerLostError)
+        assert executor.get_task_failure_info(key) == (None, "WorkerLost")
 
     def test_error_sending_workload(self):
         from airflow.providers.celery.executors import celery_executor, celery_executor_utils
